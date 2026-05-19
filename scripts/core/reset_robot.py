@@ -13,13 +13,19 @@ def main():
         cfg = yaml.safe_load(f)
 
     # 创建机器人配置
+    robot_cfg = cfg["record"]["robot"]
     robot_config = FrankaConfig(
-        robot_ip=cfg["record"]["robot"]["ip"],
-        use_gripper=cfg["record"]["robot"]["use_gripper"],
-        close_threshold=cfg["record"]["robot"]["close_threshold"],
-        gripper_bin_threshold=cfg["record"]["robot"]["gripper_bin_threshold"],
-        gripper_reverse=cfg["record"]["robot"]["gripper_reverse"],
-        gripper_max_open=cfg["record"]["robot"]["gripper_max_open"],
+        robot_ip=robot_cfg.get("robot_sn", robot_cfg["ip"]),
+        network_interface=robot_cfg.get("network_interface"),
+        gripper_name=robot_cfg.get("gripper_name"),
+        home_plan=robot_cfg.get("home_plan", "PLAN-Home"),
+        home_joints=robot_cfg.get("home_joints"),
+        command_frequency=robot_cfg.get("command_frequency", 50),
+        use_gripper=robot_cfg["use_gripper"],
+        close_threshold=robot_cfg["close_threshold"],
+        gripper_bin_threshold=robot_cfg["gripper_bin_threshold"],
+        gripper_reverse=robot_cfg["gripper_reverse"],
+        gripper_max_open=robot_cfg["gripper_max_open"],
         debug=False
     )
     

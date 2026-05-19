@@ -14,10 +14,6 @@ import numpy as np
 from lerobot.cameras.configs import ColorMode, Cv2Rotation
 from lerobot.cameras.realsense.camera_realsense import RealSenseCameraConfig
 
-HOME_JOINT_POSITION = np.array(
-    [1.58472168, -1.56486702, -1.74356186, -2.634835, -0.11180906, 4.2022109, -1.51133597]
-)
-
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 class Franka(Robot):
@@ -82,22 +78,30 @@ class Franka(Robot):
 
     def _check_franka_connection(self, robot_ip: str):
         try:
-            logger.info("\n===== [ROBOT] Connecting to Franka robot =====")
+            logger.info("\n===== [ROBOT] Connecting to Flexiv robot =====")
             
-            franka = FrankaInterfaceClient(ip=robot_ip, port=4242)
+            franka = FrankaInterfaceClient(
+                ip=robot_ip,
+                port=4242,
+                network_interface=self.config.network_interface,
+                gripper_name=self.config.gripper_name,
+                command_frequency=self.config.command_frequency,
+                home_plan=self.config.home_plan,
+            )
             franka.robot_start_joint_impedance_control()
 
             joint_positions = franka.robot_get_joint_positions()
             if joint_positions is not None and len(joint_positions) == 7:
                 formatted_joints = [round(j, 4) for j in joint_positions]
                 logger.info(f"[ROBOT] Current joint positions: {formatted_joints}")
-                logger.info("===== [ROBOT] Franka connected successfully =====\n")
+                logger.info("===== [ROBOT] Flexiv connected successfully =====\n")
             else:
                 logger.info("===== [ERROR] Failed to read joint positions. Check connection or remote control mode =====")
 
         except Exception as e:
-            logger.info("===== [ERROR] Failed to connect to Franka robot =====")
+            logger.info("===== [ERROR] Failed to connect to Flexiv robot =====")
             logger.info(f"Exception: {e}\n")
+            raise
 
         return franka
 
@@ -119,9 +123,13 @@ class Franka(Robot):
         #     blocking=True
         # )
 
-        # joint_positions = np.array([1.58472168, -1.56486702, -1.74356186, -2.634835, -0.11180906, 4.2022109, -1.51133597])
-        print(f"\nMoving joint positions to: {HOME_JOINT_POSITION} ...\n")
-        self._robot.robot_move_to_joint_positions(positions = HOME_JOINT_POSITION, time_to_go=5.0)
+        if self.config.home_joints is not None:
+            home_joints = np.array(self.config.home_joints, dtype=float)
+            print(f"\nMoving joint positions to: {home_joints} ...\n")
+            self._robot.robot_move_to_joint_positions(positions=home_joints, time_to_go=5.0)
+        else:
+            print(f"\nExecuting home plan: {self.config.home_plan} ...\n")
+            self._robot.robot_go_home()
         self._robot.gripper_goto(
             width=self.config.gripper_max_open,
             speed=self._gripper_speed,
@@ -226,7 +234,7 @@ class Franka(Robot):
                 gripper_state_norm = 1 - gripper_state_norm
             self._gripper_position = gripper_state_norm
         except Exception as e:
-            logger.warning(f"[GRIPPER] zerorpc error: {e}")
+            logger.warning(f"[GRIPPER] Flexiv gripper error: {e}")
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         if not self.is_connected:
@@ -289,7 +297,12 @@ class Franka(Robot):
                 #     force=self._gripper_force,
                 #     blocking=True
                 # )
-                self._robot.robot_move_to_joint_positions(positions = HOME_JOINT_POSITION, time_to_go=5.0)
+                if self.config.home_joints is not None:
+                    self._robot.robot_move_to_joint_positions(
+                        positions=np.array(self.config.home_joints, dtype=float), time_to_go=5.0
+                    )
+                else:
+                    self._robot.robot_go_home()
                 self._robot.gripper_goto(
                     width=self.config.gripper_max_open,
                     speed=self._gripper_speed,
@@ -360,7 +373,7 @@ class Franka(Robot):
                     try:
                         self._robot.robot_update_desired_ee_pose(target_ee_pose)
                     except Exception as e:
-                        logger.warning(f"[ROBOT] zerorpc error during interpolation step {step}: {e}")
+                        logger.warning(f"[ROBOT] Flexiv error during interpolation step {step}: {e}")
                         break
                     time.sleep(0.01)  # 每步间隔 10ms
             elif np.linalg.norm(delta_ee_pose) >= 0.01:
@@ -374,7 +387,7 @@ class Franka(Robot):
                 try:
                     self._robot.robot_update_desired_ee_pose(target_ee_pose)
                 except Exception as e:
-                    logger.warning(f"[ROBOT] zerorpc error: {e}")
+                    logger.warning(f"[ROBOT] Flexiv error: {e}")
         
         if "gripper_cmd_bin" in action:
             self._handle_gripper(action["gripper_cmd_bin"], is_binary=True)
@@ -459,7 +472,7 @@ class Franka(Robot):
             # Read end effector pose
             ee_pose = self._robot.robot_get_ee_pose()
         except Exception as e:
-            logger.warning(f"[ROBOT] zerorpc error in get_observation: {e}")
+            logger.warning(f"[ROBOT] Flexiv error in get_observation: {e}")
             # 返回上次的观测值作为 fallback
             if self._prev_observation is not None:
                 return self._prev_observation

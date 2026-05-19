@@ -18,8 +18,12 @@ class ReplayConfig:
         self.episode_idx: str = cfg.get("episode_idx", 0)
 
         # robot config
-        self.robot_ip: str = robot["ip"]
-        # self.gripper_port: str = robot["gripper_port"]
+        self.robot_ip: str = robot.get("robot_sn", robot["ip"])
+        self.network_interface: str | None = robot.get("network_interface")
+        self.gripper_name: str | None = robot.get("gripper_name")
+        self.home_plan: str = robot.get("home_plan", "PLAN-Home")
+        self.home_joints: list[float] | None = robot.get("home_joints")
+        self.command_frequency: int = robot.get("command_frequency", 50)
         self.control_mode: str = cfg["control_mode"]
 
 def run_replay(replay_cfg: ReplayConfig):
@@ -27,7 +31,11 @@ def run_replay(replay_cfg: ReplayConfig):
 
     robot_config = FrankaConfig(
         robot_ip=replay_cfg.robot_ip,
-        # gripper_port=replay_cfg.gripper_port,
+        network_interface=replay_cfg.network_interface,
+        gripper_name=replay_cfg.gripper_name,
+        home_plan=replay_cfg.home_plan,
+        home_joints=replay_cfg.home_joints,
+        command_frequency=replay_cfg.command_frequency,
         debug = False,
         gripper_reverse = False,
         control_mode = replay_cfg.control_mode

@@ -1,45 +1,130 @@
-'''
-running on the user machine 
-to connect to the franka_interface_server 
-'''
+"""Flexiv RDK adapter with the legacy FrankaInterfaceClient API.
+
+The rest of this teleoperation project was written against a small Franka/Polymetis
+client.  Keeping the same method names lets the LeRobot integration use Flexiv
+without rewriting the recording, replay, and teleoperator paths.
+"""
+
+from __future__ import annotations
+
 import logging
+import time
+from typing import Iterable
+
 import numpy as np
-import zerorpc
+from scipy.spatial.transform import Rotation as R
 
 log = logging.getLogger(__name__)
 
+
 class FrankaInterfaceClient:
-    def __init__(self, ip='192.168.1.109', port=4242):
+    """Compatibility wrapper around ``flexivrdk.Robot`` and ``flexivrdk.Gripper``.
+
+    ``ip`` is kept for backward compatibility, but for Flexiv it should contain the
+    robot serial number, for example ``Rizon4s-123456``.  Optionally pass
+    ``network_interface`` as the local network interface IP if discovery needs to be
+    restricted.
+    """
+
+    def __init__(
+        self,
+        ip: str = "Rizon4s-123456",
+        port: int = 4242,
+        *,
+        robot_sn: str | None = None,
+        network_interface: str | None = None,
+        gripper_name: str | None = None,
+        command_frequency: int = 50,
+        home_plan: str = "PLAN-Home",
+    ):
+        del port  # Kept only to preserve the legacy constructor signature.
         try:
-            self.server = zerorpc.Client(heartbeat=20)
-            self.server.connect(f"tcp://{ip}:{port}")
-            log.info("Connected to server")
-        except:
-            log.error("Failed to connect to server")
+            import flexivrdk
+        except ImportError as exc:
+            raise ImportError(
+                "flexivrdk is required for Flexiv control. Install the Flexiv RDK Python "
+                "package in the active environment."
+            ) from exc
+
+        self._flexivrdk = flexivrdk
+        self._mode = flexivrdk.Mode
+        self._robot_sn = robot_sn or ip
+        self._network_interface = network_interface
+        self._gripper_name = gripper_name
+        self._home_plan = home_plan
+        self._period = 1.0 / command_frequency
+        self._gripper = None
+
+        whitelist = [network_interface] if network_interface else []
+        self.robot = flexivrdk.Robot(self._robot_sn, whitelist)
+        self._prepare_robot()
+        log.info("Connected to Flexiv robot %s", self._robot_sn)
+
+    def _prepare_robot(self) -> None:
+        if self.robot.fault():
+            log.warning("Fault occurred on Flexiv robot, trying to clear ...")
+            if not self.robot.ClearFault():
+                raise RuntimeError("Flexiv robot fault cannot be cleared")
+
+        if not self.robot.operational():
+            log.info("Enabling Flexiv robot ...")
+            self.robot.Enable()
+            while not self.robot.operational():
+                time.sleep(0.5)
+
+    @staticmethod
+    def _as_list(values: Iterable[float]) -> list[float]:
+        return [float(v) for v in values]
+
+    @staticmethod
+    def _tcp_pose_to_rotvec_pose(tcp_pose: Iterable[float]) -> np.ndarray:
+        pose = np.asarray(tcp_pose, dtype=float)
+        quat_xyzw = [pose[4], pose[5], pose[6], pose[3]]
+        rotvec = R.from_quat(quat_xyzw).as_rotvec()
+        return np.concatenate([pose[:3], rotvec])
+
+    @staticmethod
+    def _rotvec_pose_to_tcp_pose(pose: Iterable[float]) -> list[float]:
+        pose = np.asarray(pose, dtype=float)
+        quat_xyzw = R.from_rotvec(pose[3:6]).as_quat()
+        return [
+            float(pose[0]),
+            float(pose[1]),
+            float(pose[2]),
+            float(quat_xyzw[3]),
+            float(quat_xyzw[0]),
+            float(quat_xyzw[1]),
+            float(quat_xyzw[2]),
+        ]
+
+    def _switch_mode(self, mode) -> None:
+        if self.robot.mode() != mode:
+            self.robot.SwitchMode(mode)
 
     def gripper_initialize(self):
-        try:
-            self.server.gripper_initialize()
-            log.info("Connected to gripper")
-        except:
-            log.error("Failed to connect to gripper")
+        if not self._gripper_name:
+            log.warning("No Flexiv gripper_name configured; gripper control is disabled")
+            return
+        self._gripper = self._flexivrdk.Gripper(self.robot)
+        self._gripper.Enable(self._gripper_name)
+        log.info("Connected to Flexiv gripper %s", self._gripper_name)
 
     def gripper_goto(
-        self, 
-        width: float, 
-        speed: float, 
-        force: float, 
+        self,
+        width: float,
+        speed: float,
+        force: float,
         epsilon_inner: float = -1.0,
         epsilon_outer: float = -1.0,
-        blocking: bool = True
+        blocking: bool = True,
     ):
-        # self.server.gripper_goto(
-        #     width=width,
-        #     speed=speed,
-        #     force=force,
-        #     blocking=blocking,
-        # )
-        self.server.gripper_goto(width, speed, force, epsilon_inner, epsilon_outer, blocking)
+        del epsilon_inner, epsilon_outer
+        if self._gripper is None:
+            return
+        self._gripper.Move(float(width), float(speed), float(force))
+        if blocking:
+            while self._gripper.states().is_moving:
+                time.sleep(0.02)
 
     def gripper_grasp(
         self,
@@ -50,150 +135,119 @@ class FrankaInterfaceClient:
         epsilon_outer: float = -1.0,
         blocking: bool = True,
     ):
-        # self.server.gripper_grasp(
-        #     speed=speed,
-        #     force=force,
-        #     grasp_width=grasp_width,
-        #     epsilon_inner=epsilon_inner,
-        #     epsilon_outer=epsilon_outer,
-        #     blocking=blocking,
-        # )
-        self.server.gripper_grasp(
-            speed,
-            force,
-            grasp_width,
-            epsilon_inner,
-            epsilon_outer,
-            blocking,
-        )
+        del speed, grasp_width, epsilon_inner, epsilon_outer, blocking
+        if self._gripper is not None:
+            self._gripper.Grasp(float(force))
 
-    def gripper_get_state(self)-> dict:
-        return self.server.gripper_get_state()
+    def gripper_get_state(self) -> dict:
+        if self._gripper is None:
+            return {"width": 0.0, "force": 0.0, "is_moving": False}
+        state = self._gripper.states()
+        return {
+            "width": float(state.width),
+            "force": float(state.force),
+            "is_moving": bool(state.is_moving),
+        }
 
-    
     def robot_get_joint_positions(self):
-        '''
-        list -> np.ndarray
-        '''
-        joint_positions = np.array(self.server.robot_get_joint_positions())
-        return joint_positions
+        return np.asarray(self.robot.states().q[:7], dtype=float)
 
     def robot_get_joint_velocities(self):
-        '''
-        list -> np.ndarray
-        '''
-        joint_velocities = np.array(self.server.robot_get_joint_velocities())
-        return joint_velocities
-    
+        return np.asarray(self.robot.states().dq[:7], dtype=float)
+
     def robot_get_ee_pose(self):
-        '''
-        list -> np.ndarray
-        '''
-        pose = np.array(self.server.robot_get_ee_pose())
-        return pose
+        return self._tcp_pose_to_rotvec_pose(self.robot.states().tcp_pose)
 
     def robot_move_to_joint_positions(
         self,
         positions: np.ndarray,
-        time_to_go: float = None,
+        time_to_go: float | None = None,
         delta: bool = False,
-        Kq: np.ndarray = None,
-        Kqd: np.ndarray = None,
+        Kq: np.ndarray | None = None,
+        Kqd: np.ndarray | None = None,
     ):
-        self.server.robot_move_to_joint_positions(
-            positions.tolist(), 
-            time_to_go, 
-            delta, 
-            Kq.tolist() if Kq is not None else None, 
-            Kqd.tolist() if Kqd is not None else None
-        )
+        del Kq, Kqd
+        self.robot_start_joint_impedance_control()
+        current = self.robot_get_joint_positions()
+        target = np.asarray(positions, dtype=float)
+        if delta:
+            target = current + target
+
+        duration = float(time_to_go or 0.0)
+        steps = max(1, int(duration / self._period))
+        for pos in np.linspace(current, target, steps):
+            self.robot_update_desired_joint_positions(pos)
+            time.sleep(self._period)
 
     def robot_go_home(self):
-        self.server.robot_go_home()
+        self._switch_mode(self._mode.NRT_PLAN_EXECUTION)
+        self.robot.ExecutePlan(self._home_plan)
+        while self.robot.busy():
+            time.sleep(0.2)
 
     def robot_move_to_ee_pose(
         self,
-        # position: np.ndarray = None,
-        # orientation: np.ndarray = None,
-        pose: np.ndarray = None,
-        time_to_go: float = None,
+        pose: np.ndarray,
+        time_to_go: float | None = None,
         delta: bool = False,
-        Kx: np.ndarray = None,
-        Kxd: np.ndarray = None,
+        Kx: np.ndarray | None = None,
+        Kxd: np.ndarray | None = None,
         op_space_interp: bool = True,
     ):
-        self.server.robot_move_to_ee_pose(
-            pose.tolist(),
-            time_to_go,
-            delta,
-            Kx.tolist() if Kx is not None else None,
-            Kxd.tolist() if Kxd is not None else None,
-            op_space_interp,
-        )
+        del Kx, Kxd, op_space_interp
+        self.robot_start_cartesian_impedance_control(None, None)
+        target = np.asarray(pose, dtype=float)
+        current = self.robot_get_ee_pose()
+        if delta:
+            target = current + target
+
+        duration = float(time_to_go or 0.0)
+        steps = max(1, int(duration / self._period))
+        for interp_pose in np.linspace(current, target, steps):
+            self.robot_update_desired_ee_pose(interp_pose)
+            time.sleep(self._period)
 
     def robot_start_joint_impedance_control(
-        self, 
-        Kq: np.ndarray = None, 
-        Kqd: np.ndarray = None, 
+        self,
+        Kq: np.ndarray | None = None,
+        Kqd: np.ndarray | None = None,
         adaptive: bool = True,
     ):
-        self.server.robot_start_joint_impedance_control(
-            Kq.tolist() if Kq is not None else None,
-            Kqd.tolist() if Kqd is not None else None,
-            adaptive,
-        )
-        print(f"[ROBOT] Joint impedance control started")
+        del Kq, Kqd, adaptive
+        self._switch_mode(self._mode.NRT_JOINT_POSITION)
+        log.info("[ROBOT] Flexiv joint position control started")
 
-    def robot_start_cartesian_impedance_control(self, Kx: np.ndarray, Kxd: np.ndarray):
-        self.server.robot_start_cartesian_impedance_control(
-            Kx.tolist() if Kx is not None else None,
-            Kxd.tolist() if Kxd is not None else None,
-        )
-        print(f"[ROBOT] Cartesian impedance control started")
-
+    def robot_start_cartesian_impedance_control(self, Kx: np.ndarray | None, Kxd: np.ndarray | None):
+        del Kx, Kxd
+        self._switch_mode(self._mode.NRT_CARTESIAN_MOTION_FORCE)
+        self.robot.SetForceControlAxis([False, False, False, False, False, False])
+        log.info("[ROBOT] Flexiv cartesian motion control started")
 
     def robot_update_desired_joint_positions(self, positions: np.ndarray):
-        try:
-            self.server.robot_update_desired_joint_positions(positions.tolist())
-        except Exception as e:
-            log.warning(f"[ROBOT] robot_update_desired_joint_positions failed: {e}")
+        dof = len(self.robot.info().q_min) or 7
+        target_pos = self._as_list(positions)[:dof]
+        target_vel = [0.0] * len(target_pos)
+        max_vel = [2.0] * len(target_pos)
+        max_acc = [3.0] * len(target_pos)
+        self.robot.SendJointPosition(target_pos, target_vel, max_vel, max_acc)
 
     def robot_update_desired_ee_pose(self, pose: np.ndarray):
-        try:
-            self.server.robot_update_desired_ee_pose(pose.tolist())
-        except Exception as e:
-            log.warning(f"[ROBOT] robot_update_desired_ee_pose failed: {e}")
+        self.robot.SendCartesianMotionForce(self._rotvec_pose_to_tcp_pose(pose))
 
     def robot_terminate_current_policy(self):
-        self.server.robot_terminate_current_policy()
+        self.robot.Stop()
 
     def close(self):
-        self.server.close()
+        if self._gripper is not None:
+            try:
+                self._gripper.Stop()
+            except Exception:
+                log.exception("Failed to stop Flexiv gripper")
+        self.robot.Stop()
+
 
 if __name__ == "__main__":
-    
-    Franka = FrankaInterfaceClient(ip="192.168.1.109")
-    Franka.gripper_initialize()
-    
-    Franka.gripper_goto(width=0.06, speed=0.1, force=10.0)
-    gripper_state = Franka.gripper_get_state()
-    print(f"Current gripper state: {gripper_state}")
-    
-    # Franka.gripper_goto(width=0.08, speed=0.1, force=10.0)
-    # Reset
-    Franka.robot_go_home()
-
-    # Get joint positions
-    joint_positions = Franka.robot_get_joint_positions()
-    print(f"Current joint positions: {joint_positions}")
-
-    # Command robot to pose (move 4th and 6th joint)
-    joint_positions_desired = np.array(
-        [-0.14, -0.02, -0.05, -1.57, 0.05, 1.50, -0.91]
-    )
-    print(f"\nMoving joints to: {joint_positions_desired} ...\n")
-    state_log = Franka.robot_move_to_joint_positions(joint_positions_desired, time_to_go=2.0)
-
-    # Get updated joint positions
-    joint_positions = Franka.robot_get_joint_positions()
-    print(f"New joint positions: {joint_positions}")
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    flexiv = FrankaInterfaceClient(ip="Rizon4s-123456")
+    flexiv.robot_go_home()
+    print(f"Current joint positions: {flexiv.robot_get_joint_positions()}")

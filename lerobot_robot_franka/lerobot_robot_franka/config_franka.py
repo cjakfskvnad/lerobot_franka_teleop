@@ -9,7 +9,14 @@ from lerobot.robots.config import RobotConfig
 class FrankaConfig(RobotConfig):
     use_gripper: bool = True
     gripper_reverse: bool = True
-    robot_ip: str = "192.168.1.104"
+    # Backward-compatible field name. For Flexiv this should be the robot serial
+    # number, for example "Rizon4s-123456".
+    robot_ip: str = "Rizon4s-123456"
+    network_interface: str | None = None
+    gripper_name: str | None = None
+    home_plan: str = "PLAN-Home"
+    home_joints: list[float] | None = None
+    command_frequency: int = 50
     gripper_bin_threshold: float = 0.98
     gripper_max_open: float = 0.0801  # gripper max open width in meters
     debug: bool = True
@@ -18,4 +25,3 @@ class FrankaConfig(RobotConfig):
     control_mode: str = "isoteleop"
     # Execute mode for oculus: "ee_pose" (cartesian impedance) or "joint" (joint impedance via IK)
     execute_mode: str = "ee_pose"
-

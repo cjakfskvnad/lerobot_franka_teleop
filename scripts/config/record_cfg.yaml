@@ -38,9 +38,9 @@ record:
       placo_dt: 0.01
       # Placo IK settings for oculus joint mode
       enable_ik: False               # 是否启用 Placo IK 计算关节位置（run_policy 时可设为 False）
-      robot_ip: "192.168.110.15"    # Franka robot IP for reading current joint states
-      robot_port: 4242              # Franka zerorpc port
-      ik_urdf_path: "assets/franka_urdf/fr3v2_no_mesh.urdf"  # No-mesh URDF for IK solver, empty to disable
+      robot_ip: "Rizon4s-123456"    # Flexiv robot serial number for reading current joint states
+      robot_port: 4242              # Kept for compatibility, unused by Flexiv RDK
+      ik_urdf_path: "assets/franka_urdf/fr3v2_no_mesh.urdf"  # Replace with Flexiv URDF if enabling IK
       ik_iterations: 30              # IK 求解迭代次数，值越大精度越高但更慢（推荐 8~15）
       # ── Placo IK 任务权重 ──────────────────────────────────────────────
       # Placo 将 IK 分解为多个加权"soft"任务，求解器在每次迭代中按权重
@@ -56,8 +56,13 @@ record:
       ik_regularization: 1.0e-4     # 正则化权重，防止数值奇异（一般不调）
       
   robot:
-    # ip: &ip "172.16.0.2" # robot ip
-    ip: &ip "192.168.110.15" # NUC ip
+    robot_sn: &ip "Rizon4s-123456" # Flexiv robot serial number, e.g. Rizon4s-123456
+    ip: "Rizon4s-123456" # Backward-compatible alias; robot_sn is used when present
+    network_interface:  # Optional local NIC IPv4 used to discover the robot, e.g. "192.168.2.102"
+    gripper_name:       # Flexiv Elements -> Settings -> Device full gripper name; leave empty to disable gripper device init
+    home_plan: "PLAN-Home"
+    home_joints:        # Optional 7 joint angles. If empty, reset uses home_plan instead.
+    command_frequency: 50
     use_gripper: *use_gripper
     close_threshold: 0.7 # threshold to determine gripper open/close
     gripper_bin_threshold: 0.98 # threshold to determine gripper is closed

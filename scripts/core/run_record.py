@@ -62,7 +62,12 @@ class RecordConfig:
         self._parse_policy_config(policy)
         
         # Robot config
-        self.robot_ip: str = robot["ip"]
+        self.robot_ip: str = robot.get("robot_sn", robot["ip"])
+        self.network_interface: str | None = robot.get("network_interface")
+        self.gripper_name: str | None = robot.get("gripper_name")
+        self.home_plan: str = robot.get("home_plan", "PLAN-Home")
+        self.home_joints: list[float] | None = robot.get("home_joints")
+        self.command_frequency: int = robot.get("command_frequency", 50)
         self.use_gripper: bool = robot["use_gripper"]
         self.close_threshold = robot["close_threshold"]
         self.gripper_reverse: bool = robot["gripper_reverse"]
@@ -202,7 +207,7 @@ def check_joint_offsets(record_cfg: RecordConfig):
 
     start_joints = get_start_joints(record_cfg)
     if start_joints is None:
-        raise RuntimeError("Failed to retrieve start joints from Franka robot.")
+        raise RuntimeError("Failed to retrieve start joints from Flexiv robot.")
 
     joint_offsets = compute_joint_offsets(record_cfg, start_joints)
 
@@ -260,6 +265,11 @@ def run_record(record_cfg: RecordConfig):
         
         robot_config = FrankaConfig(
             robot_ip=record_cfg.robot_ip,
+            network_interface=record_cfg.network_interface,
+            gripper_name=record_cfg.gripper_name,
+            home_plan=record_cfg.home_plan,
+            home_joints=record_cfg.home_joints,
+            command_frequency=record_cfg.command_frequency,
             cameras = camera_config,
             debug = record_cfg.debug,
             close_threshold = record_cfg.close_threshold,

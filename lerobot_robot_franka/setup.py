@@ -8,9 +8,9 @@ setup(
     author_email="shenzhaolong@buaa.edu.cn",
     packages=find_packages(),
     install_requires=[
+        "flexivrdk",
         "pyrealsense2",
         "scipy",
-        "zerorpc",
     ],
     python_requires=">=3.10",
     classifiers=[

@@ -12,17 +12,24 @@ logger = logging.getLogger(__name__)
 
 # ------------------------ Robot Functions ------------------------ #
 def get_start_joints(cfg) -> List[float]:
-    """Connects to the Franka robot and retrieves current joint positions."""
+    """Connects to the Flexiv robot and retrieves current joint positions."""
     try:
-        logger.info("\n===== [ROBOT] Connecting to Franka robot =====")
-        robot = FrankaInterfaceClient(ip=cfg.robot_ip, port=4242)
+        logger.info("\n===== [ROBOT] Connecting to Flexiv robot =====")
+        robot = FrankaInterfaceClient(
+            ip=cfg.robot_ip,
+            port=4242,
+            network_interface=cfg.network_interface,
+            gripper_name=cfg.gripper_name,
+            command_frequency=cfg.command_frequency,
+            home_plan=cfg.home_plan,
+        )
         robot.robot_start_joint_impedance_control()
         joint_positions = (robot.robot_get_joint_positions()).tolist()
         logger.info(f"[ROBOT] Current joint positions: {joint_positions}")
-        logger.info("===== [ROBOT] Franka connected successfully =====\n")
+        logger.info("===== [ROBOT] Flexiv connected successfully =====\n")
         return joint_positions
     except Exception as e:
-        logger.error("===== [ERROR] Failed to connect to Franka robot =====")
+        logger.error("===== [ERROR] Failed to connect to Flexiv robot =====")
         logger.error(f"Exception: {e}\n")
         return []
 
@@ -82,7 +89,11 @@ class RecordConfig:
         self.hardware_offsets = dxl_cfg["hardware_offsets"]
 
         # Robot config
-        self.robot_ip: str = robot["ip"]
+        self.robot_ip: str = robot.get("robot_sn", robot["ip"])
+        self.network_interface: str | None = robot.get("network_interface")
+        self.gripper_name: str | None = robot.get("gripper_name")
+        self.home_plan: str = robot.get("home_plan", "PLAN-Home")
+        self.command_frequency: int = robot.get("command_frequency", 50)
 
 def run(record_cfg):
     start_joints = get_start_joints(record_cfg)
@@ -90,7 +101,7 @@ def run(record_cfg):
     if start_joints:
         return compute_joint_offsets(record_cfg, start_joints)
     else:
-        raise RuntimeError("Failed to retrieve start joints from Franka robot.")
+        raise RuntimeError("Failed to retrieve start joints from Flexiv robot.")
 
 # ------------------------ Main ------------------------ #
 def main():
