@@ -18,6 +18,8 @@ def main():
         robot_ip=robot_cfg.get("robot_sn", robot_cfg["ip"]),
         network_interface=robot_cfg.get("network_interface"),
         gripper_name=robot_cfg.get("gripper_name"),
+        gripper_init=robot_cfg.get("gripper_init", False),
+        gripper_init_wait_sec=robot_cfg.get("gripper_init_wait_sec", 5.0),
         home_plan=robot_cfg.get("home_plan", "PLAN-Home"),
         home_joints=robot_cfg.get("home_joints"),
         command_frequency=robot_cfg.get("command_frequency", 50),

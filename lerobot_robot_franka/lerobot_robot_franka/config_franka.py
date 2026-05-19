@@ -14,6 +14,8 @@ class FrankaConfig(RobotConfig):
     robot_ip: str = "Rizon4s-123456"
     network_interface: str | None = None
     gripper_name: str | None = None
+    gripper_init: bool = False
+    gripper_init_wait_sec: float = 5.0
     home_plan: str = "PLAN-Home"
     home_joints: list[float] | None = None
     command_frequency: int = 50

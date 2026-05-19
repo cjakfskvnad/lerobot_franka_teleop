@@ -52,6 +52,8 @@ class OculusTeleopConfig(BaseTeleopConfig):
     ik_ori_weight: float = 0.5          # IK orientation task weight
     ik_joints_weight: float = 0.2       # IK joints anchoring task weight (7-DOF redundancy)
     ik_regularization: float = 1e-4     # IK regularization weight
+    log_actions: bool = False           # Print live Oculus actions during record
+    log_action_period_sec: float = 0.2   # Live action print interval
 
 
 # Legacy compatibility: FrankaTeleopConfig maps to DynamixelTeleopConfig

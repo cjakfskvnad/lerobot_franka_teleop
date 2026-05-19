@@ -28,9 +28,11 @@ record:
       use_gripper: *use_gripper # whether the spacemouse robot can use gripper
       pose_scaler: [0.01, 0.05] # scaler for spacemouse actions [position, attitude]
     oculus_config:
-      ip: "192.168.110.62"  # Oculus Quest IP address
+      ip: null  # Use USB connection; set to Quest IP address for wireless ADB
       use_gripper: *use_gripper
-      pose_scaler: [3.0, 2.0]  # scaler for oculus actions [position, attitude]
+      log_actions: true
+      log_action_period_sec: 0.2
+      pose_scaler: [1.0, 0.8]  # scaler for oculus actions [position, attitude]
       channel_signs: [1, 1, 1, -1, -1, 1]  # signs for each axis [x, y, z, rx, ry, rz]
       # channel_signs: [-1, -1, 1, 1, 1, 1] # mirror
     placo:
@@ -38,7 +40,7 @@ record:
       placo_dt: 0.01
       # Placo IK settings for oculus joint mode
       enable_ik: False               # 是否启用 Placo IK 计算关节位置（run_policy 时可设为 False）
-      robot_ip: "Rizon4s-123456"    # Flexiv robot serial number for reading current joint states
+      robot_ip: "Rizon4s-063425"    # Flexiv robot serial number for reading current joint states
       robot_port: 4242              # Kept for compatibility, unused by Flexiv RDK
       ik_urdf_path: "assets/franka_urdf/fr3v2_no_mesh.urdf"  # Replace with Flexiv URDF if enabling IK
       ik_iterations: 30              # IK 求解迭代次数，值越大精度越高但更慢（推荐 8~15）
@@ -56,10 +58,12 @@ record:
       ik_regularization: 1.0e-4     # 正则化权重，防止数值奇异（一般不调）
       
   robot:
-    robot_sn: &ip "Rizon4s-123456" # Flexiv robot serial number, e.g. Rizon4s-123456
-    ip: "Rizon4s-123456" # Backward-compatible alias; robot_sn is used when present
+    robot_sn: &ip "Rizon4s-063425" # Flexiv robot serial number, e.g. Rizon4s-123456
+    ip: "Rizon4s-063425" # Backward-compatible alias; robot_sn is used when present
     network_interface:  # Optional local NIC IPv4 used to discover the robot, e.g. "192.168.2.102"
-    gripper_name:       # Flexiv Elements -> Settings -> Device full gripper name; leave empty to disable gripper device init
+    gripper_name: "Flexiv-GN01" # Flexiv Elements -> Settings -> Device full gripper name; leave empty to disable gripper device init
+    gripper_init: true  # Trigger Gripper.Init() after enabling the device
+    gripper_init_wait_sec: 5.0
     home_plan: "PLAN-Home"
     home_joints:        # Optional 7 joint angles. If empty, reset uses home_plan instead.
     command_frequency: 50
@@ -68,7 +72,7 @@ record:
     gripper_bin_threshold: 0.98 # threshold to determine gripper is closed
     # gripper_port: &gripper_port "/dev/franka_left_gripper" # gripper_port
     gripper_reverse: false  # If gripper moves opposite, flip this value
-    gripper_max_open: 0.085 # gripper max open width in meters 0.0801 for franka hand, 0.12 for robotiq gripper
+    gripper_max_open: 0.1 # Flexiv-GN01 max open width in meters
     # Execute mode for oculus control: "ee_pose" (cartesian impedance) or "joint" (joint impedance via Placo IK)
     execute_mode: "ee_pose"
 
@@ -87,7 +91,7 @@ record:
     # description: "pick up the red chili and put it into the brown basket" # task description
     # description: "pick up the red chili and put it into the brown basket"
     num_episodes: 10 # number of episodes to record
-    display: True # Whether to display the data during recording
+    display: False # Whether to display the data during recording
     resume: false # whether to resume from an existing dataset
     resume_dataset: roboticiq/pick_all_yellow_cube_to_brown_basket_20260208_v01 # dataset to resume from if resume is True
   
@@ -97,7 +101,8 @@ record:
     save_meta_period: 1 # Save metadata after every N episodes
 
   cameras:
-    wrist_cam_serial: "344322074412" # wrist camera serial number 243222071212 344322074412
+    enabled: false # Set true when RealSense cameras are connected
+    wrist_cam_serial: "317422075656" # wrist camera serial number 243222071212 344322074412
     exterior_cam_serial: "243322071821" # exterior camera serial number 243322071821 339322074423
     width: 424 # 640 424
     height: 240 # 360 240
@@ -116,7 +121,3 @@ replay:
 visualize:
   dataset_name: babycare/milk_power_20260321_v03
   episode_index: 0 # episode index to visualize
-
-
-
-

@@ -40,7 +40,7 @@ class RecordConfig:
         storage = cfg["storage"]
         task = cfg["task"]
         time = cfg["time"]
-        cam = cfg["cameras"]
+        cam = cfg.get("cameras", {})
         robot = cfg["robot"]
         policy = cfg["policy"]
         teleop = cfg["teleop"]
@@ -65,6 +65,8 @@ class RecordConfig:
         self.robot_ip: str = robot.get("robot_sn", robot["ip"])
         self.network_interface: str | None = robot.get("network_interface")
         self.gripper_name: str | None = robot.get("gripper_name")
+        self.gripper_init: bool = robot.get("gripper_init", False)
+        self.gripper_init_wait_sec: float = robot.get("gripper_init_wait_sec", 5.0)
         self.home_plan: str = robot.get("home_plan", "PLAN-Home")
         self.home_joints: list[float] | None = robot.get("home_joints")
         self.command_frequency: int = robot.get("command_frequency", 50)
@@ -88,10 +90,11 @@ class RecordConfig:
         self.save_mera_period: int = time.get("save_mera_period", 1)
         
         # Cameras config
-        self.wrist_cam_serial: str = cam["wrist_cam_serial"]
-        self.exterior_cam_serial: str = cam["exterior_cam_serial"]
-        self.width: int = cam["width"]
-        self.height: int = cam["height"]
+        self.cameras_enabled: bool = cam.get("enabled", True)
+        self.wrist_cam_serial: str | None = cam.get("wrist_cam_serial")
+        self.exterior_cam_serial: str | None = cam.get("exterior_cam_serial")
+        self.width: int = cam.get("width", 424)
+        self.height: int = cam.get("height", 240)
         
         # Storage config
         self.push_to_hub: bool = storage.get("push_to_hub", False)
@@ -120,6 +123,8 @@ class RecordConfig:
             self.oculus_ip = oculus_cfg.get("ip", "192.168.110.62")
             self.pose_scaler = oculus_cfg.get("pose_scaler", [1.0, 1.0])
             self.channel_signs = oculus_cfg.get("channel_signs", [1, 1, 1, 1, 1, 1])
+            self.oculus_log_actions = oculus_cfg.get("log_actions", False)
+            self.oculus_log_action_period_sec = oculus_cfg.get("log_action_period_sec", 0.2)
             # Placo IK settings (now read from placo section)
             placo_cfg = teleop.get("placo", {})
             self.oculus_robot_ip = placo_cfg.get("robot_ip", "192.168.110.15")
@@ -194,6 +199,8 @@ class RecordConfig:
                 ik_ori_weight=self.oculus_ik_ori_weight,
                 ik_joints_weight=self.oculus_ik_joints_weight,
                 ik_regularization=self.oculus_ik_regularization,
+                log_actions=self.oculus_log_actions,
+                log_action_period_sec=self.oculus_log_action_period_sec,
             )
         else:
             raise ValueError(f"Unsupported control mode: {self.control_mode}")
@@ -241,24 +248,30 @@ def run_record(record_cfg: RecordConfig):
         #     check_joint_offsets(record_cfg)        
         
         # Create RealSenseCamera configurations
-        wrist_image_cfg = RealSenseCameraConfig(serial_number_or_name=record_cfg.wrist_cam_serial,
-                                        fps=record_cfg.fps,
-                                        width=record_cfg.width,
-                                        height=record_cfg.height,
-                                        color_mode=ColorMode.RGB,
-                                        use_depth=False,
-                                        rotation=Cv2Rotation.NO_ROTATION)
+        if record_cfg.cameras_enabled:
+            if not record_cfg.wrist_cam_serial or not record_cfg.exterior_cam_serial:
+                raise ValueError("cameras.enabled is true, but camera serial numbers are missing.")
 
-        exterior_image_cfg = RealSenseCameraConfig(serial_number_or_name=record_cfg.exterior_cam_serial,
-                                        fps=record_cfg.fps,
-                                        width=record_cfg.width,
-                                        height=record_cfg.height,
-                                        color_mode=ColorMode.RGB,
-                                        use_depth=False,
-                                        rotation=Cv2Rotation.NO_ROTATION)
+            wrist_image_cfg = RealSenseCameraConfig(serial_number_or_name=record_cfg.wrist_cam_serial,
+                                            fps=record_cfg.fps,
+                                            width=record_cfg.width,
+                                            height=record_cfg.height,
+                                            color_mode=ColorMode.RGB,
+                                            use_depth=False,
+                                            rotation=Cv2Rotation.NO_ROTATION)
 
-        # Create the robot and teleoperator configurations
-        camera_config = {"wrist_image": wrist_image_cfg, "exterior_image": exterior_image_cfg}
+            exterior_image_cfg = RealSenseCameraConfig(serial_number_or_name=record_cfg.exterior_cam_serial,
+                                            fps=record_cfg.fps,
+                                            width=record_cfg.width,
+                                            height=record_cfg.height,
+                                            color_mode=ColorMode.RGB,
+                                            use_depth=False,
+                                            rotation=Cv2Rotation.NO_ROTATION)
+
+            # Create the robot and teleoperator configurations
+            camera_config = {"wrist_image": wrist_image_cfg, "exterior_image": exterior_image_cfg}
+        else:
+            camera_config = {}
         
         # Create teleop config using the new method
         teleop_config = record_cfg.create_teleop_config()
@@ -267,6 +280,8 @@ def run_record(record_cfg: RecordConfig):
             robot_ip=record_cfg.robot_ip,
             network_interface=record_cfg.network_interface,
             gripper_name=record_cfg.gripper_name,
+            gripper_init=record_cfg.gripper_init,
+            gripper_init_wait_sec=record_cfg.gripper_init_wait_sec,
             home_plan=record_cfg.home_plan,
             home_joints=record_cfg.home_joints,
             command_frequency=record_cfg.command_frequency,
@@ -285,7 +300,8 @@ def run_record(record_cfg: RecordConfig):
 
         # Configure the dataset features
         action_features = hw_to_dataset_features(robot.action_features, "action")
-        obs_features = hw_to_dataset_features(robot.observation_features, "observation", use_video=True)
+        use_videos = len(camera_config) > 0
+        obs_features = hw_to_dataset_features(robot.observation_features, "observation", use_video=use_videos)
         dataset_features = {**action_features, **obs_features}
 
         if record_cfg.resume:
@@ -303,7 +319,7 @@ def run_record(record_cfg: RecordConfig):
                 fps=record_cfg.fps,
                 features=dataset_features,
                 robot_type=robot.name,
-                use_videos=True,
+                use_videos=use_videos,
                 image_writer_threads=4,
             )
         # Set the episode metadata buffer size to 1, so that each episode is saved immediately
@@ -311,7 +327,8 @@ def run_record(record_cfg: RecordConfig):
 
         # Initialize the keyboard listener and rerun visualization
         _, events = init_keyboard_listener()
-        init_rerun(session_name="recording")
+        if record_cfg.display:
+            init_rerun(session_name="recording")
 
         # Create processor
         teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
@@ -383,7 +400,7 @@ def run_record(record_cfg: RecordConfig):
                     termios.tcflush(sys.stdin, termios.TCIFLUSH)
                     user_input = input("====== [WAIT] Press Enter to reset the environment ======")
                     if user_input == "":
-                        break  
+                        break
                     else:
                         logging.info("====== [WARNING] Please press only Enter to continue ======")
 

@@ -20,6 +20,8 @@ def get_start_joints(cfg) -> List[float]:
             port=4242,
             network_interface=cfg.network_interface,
             gripper_name=cfg.gripper_name,
+            gripper_init=cfg.gripper_init,
+            gripper_init_wait_sec=cfg.gripper_init_wait_sec,
             command_frequency=cfg.command_frequency,
             home_plan=cfg.home_plan,
         )
@@ -92,6 +94,8 @@ class RecordConfig:
         self.robot_ip: str = robot.get("robot_sn", robot["ip"])
         self.network_interface: str | None = robot.get("network_interface")
         self.gripper_name: str | None = robot.get("gripper_name")
+        self.gripper_init: bool = robot.get("gripper_init", False)
+        self.gripper_init_wait_sec: float = robot.get("gripper_init_wait_sec", 5.0)
         self.home_plan: str = robot.get("home_plan", "PLAN-Home")
         self.command_frequency: int = robot.get("command_frequency", 50)
 

@@ -21,6 +21,8 @@ class ReplayConfig:
         self.robot_ip: str = robot.get("robot_sn", robot["ip"])
         self.network_interface: str | None = robot.get("network_interface")
         self.gripper_name: str | None = robot.get("gripper_name")
+        self.gripper_init: bool = robot.get("gripper_init", False)
+        self.gripper_init_wait_sec: float = robot.get("gripper_init_wait_sec", 5.0)
         self.home_plan: str = robot.get("home_plan", "PLAN-Home")
         self.home_joints: list[float] | None = robot.get("home_joints")
         self.command_frequency: int = robot.get("command_frequency", 50)
@@ -33,6 +35,8 @@ def run_replay(replay_cfg: ReplayConfig):
         robot_ip=replay_cfg.robot_ip,
         network_interface=replay_cfg.network_interface,
         gripper_name=replay_cfg.gripper_name,
+        gripper_init=replay_cfg.gripper_init,
+        gripper_init_wait_sec=replay_cfg.gripper_init_wait_sec,
         home_plan=replay_cfg.home_plan,
         home_joints=replay_cfg.home_joints,
         command_frequency=replay_cfg.command_frequency,

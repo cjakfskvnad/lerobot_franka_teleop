@@ -34,6 +34,8 @@ class FrankaInterfaceClient:
         robot_sn: str | None = None,
         network_interface: str | None = None,
         gripper_name: str | None = None,
+        gripper_init: bool = False,
+        gripper_init_wait_sec: float = 5.0,
         command_frequency: int = 50,
         home_plan: str = "PLAN-Home",
     ):
@@ -51,9 +53,14 @@ class FrankaInterfaceClient:
         self._robot_sn = robot_sn or ip
         self._network_interface = network_interface
         self._gripper_name = gripper_name
+        self._gripper_init = gripper_init
+        self._gripper_init_wait_sec = gripper_init_wait_sec
         self._home_plan = home_plan
         self._period = 1.0 / command_frequency
         self._gripper = None
+        self._gripper_params = None
+        self._tool = None
+        self._ft_sensor_zeroed = False
 
         whitelist = [network_interface] if network_interface else []
         self.robot = flexivrdk.Robot(self._robot_sn, whitelist)
@@ -101,13 +108,60 @@ class FrankaInterfaceClient:
         if self.robot.mode() != mode:
             self.robot.SwitchMode(mode)
 
+    def _zero_ft_sensor(self, timeout_sec: float = 20.0) -> None:
+        if self._ft_sensor_zeroed:
+            return
+
+        log.warning(
+            "[ROBOT] Zeroing Flexiv force/torque sensor; make sure the robot is not touching anything"
+        )
+        self._switch_mode(self._mode.NRT_PRIMITIVE_EXECUTION)
+        self.robot.ExecutePrimitive("ZeroFTSensor", dict())
+
+        deadline = time.time() + timeout_sec
+        while True:
+            primitive_states = self.robot.primitive_states()
+            if primitive_states.get("terminated", False):
+                break
+            if time.time() > deadline:
+                raise TimeoutError("Flexiv ZeroFTSensor primitive did not finish")
+            time.sleep(0.2)
+
+        self._ft_sensor_zeroed = True
+        log.info("[ROBOT] Flexiv force/torque sensor zeroing complete")
+
     def gripper_initialize(self):
         if not self._gripper_name:
             log.warning("No Flexiv gripper_name configured; gripper control is disabled")
             return
         self._gripper = self._flexivrdk.Gripper(self.robot)
         self._gripper.Enable(self._gripper_name)
-        log.info("Connected to Flexiv gripper %s", self._gripper_name)
+        self._gripper_params = self._gripper.params()
+        log.info(
+            "Connected to Flexiv gripper %s, width range [%.4f, %.4f] m",
+            self._gripper_params.name,
+            self._gripper_params.min_width,
+            self._gripper_params.max_width,
+        )
+
+        # Grippers are also robot tools. Selecting the tool updates TCP and payload
+        # compensation for subsequent Cartesian control.
+        self._switch_mode(self._mode.IDLE)
+        self._tool = self._flexivrdk.Tool(self.robot)
+        if not self._tool.exist(self._gripper_name):
+            raise RuntimeError(f"Flexiv tool [{self._gripper_name}] does not exist")
+        self._tool.Switch(self._gripper_name)
+        log.info("Switched Flexiv active tool to %s", self._tool.name())
+
+        if self._gripper_init:
+            log.info("Triggering Flexiv gripper initialization")
+            self._gripper.Init()
+            time.sleep(max(0.0, self._gripper_init_wait_sec))
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                if not self._gripper.states().is_moving:
+                    break
+                time.sleep(0.1)
 
     def gripper_goto(
         self,
@@ -121,7 +175,23 @@ class FrankaInterfaceClient:
         del epsilon_inner, epsilon_outer
         if self._gripper is None:
             return
-        self._gripper.Move(float(width), float(speed), float(force))
+        target_width = float(width)
+        target_speed = float(speed)
+        target_force = float(force)
+        if self._gripper_params is not None:
+            target_width = max(
+                self._gripper_params.min_width,
+                min(self._gripper_params.max_width, target_width),
+            )
+            target_speed = max(
+                self._gripper_params.min_vel,
+                min(self._gripper_params.max_vel, target_speed),
+            )
+            target_force = max(
+                self._gripper_params.min_force,
+                min(self._gripper_params.max_force, target_force),
+            )
+        self._gripper.Move(target_width, target_speed, target_force)
         if blocking:
             while self._gripper.states().is_moving:
                 time.sleep(0.02)
@@ -219,11 +289,14 @@ class FrankaInterfaceClient:
 
     def robot_start_cartesian_impedance_control(self, Kx: np.ndarray | None, Kxd: np.ndarray | None):
         del Kx, Kxd
+        self._zero_ft_sensor()
         self._switch_mode(self._mode.NRT_CARTESIAN_MOTION_FORCE)
         self.robot.SetForceControlAxis([False, False, False, False, False, False])
+        self.robot.SendCartesianMotionForce(self.robot.states().tcp_pose.copy())
         log.info("[ROBOT] Flexiv cartesian motion control started")
 
     def robot_update_desired_joint_positions(self, positions: np.ndarray):
+        self._switch_mode(self._mode.NRT_JOINT_POSITION)
         dof = len(self.robot.info().q_min) or 7
         target_pos = self._as_list(positions)[:dof]
         target_vel = [0.0] * len(target_pos)
@@ -232,6 +305,11 @@ class FrankaInterfaceClient:
         self.robot.SendJointPosition(target_pos, target_vel, max_vel, max_acc)
 
     def robot_update_desired_ee_pose(self, pose: np.ndarray):
+        if not self._ft_sensor_zeroed:
+            self._zero_ft_sensor()
+        if self.robot.mode() != self._mode.NRT_CARTESIAN_MOTION_FORCE:
+            self._switch_mode(self._mode.NRT_CARTESIAN_MOTION_FORCE)
+            self.robot.SetForceControlAxis([False, False, False, False, False, False])
         self.robot.SendCartesianMotionForce(self._rotvec_pose_to_tcp_pose(pose))
 
     def robot_terminate_current_policy(self):

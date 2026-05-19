@@ -66,6 +66,8 @@ class OculusTeleop(BaseTeleop):
             ik_ori_weight=self.cfg.ik_ori_weight,
             ik_joints_weight=self.cfg.ik_joints_weight,
             ik_regularization=self.cfg.ik_regularization,
+            log_actions=self.cfg.log_actions,
+            log_action_period_sec=self.cfg.log_action_period_sec,
         )
         ik_status = "enabled" if self.oculus_robot._ik_enabled else "disabled"
         logger.info(f"[TELEOP] Oculus connected at IP: {self.cfg.ip}, IK: {ik_status}")

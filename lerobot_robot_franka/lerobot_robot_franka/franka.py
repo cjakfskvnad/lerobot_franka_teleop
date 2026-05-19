@@ -36,6 +36,7 @@ class Franka(Robot):
         self._gripper_position = 1
         self._dt = 0.002
         self._last_gripper_position = 1
+        self._active_robot_controller = None
         
         # 动作平滑：指数移动平均 (EMA) 滤波器
         self._smoothing_alpha = 0.4  # 平滑系数，越小越平滑 (0~1)，0.4 是较好的折中
@@ -52,6 +53,7 @@ class Franka(Robot):
         if self.config.use_gripper:
             self._gripper = self._check_gripper_connection(self.config.robot_ip)
 
+        self._start_robot_controller_for_current_mode()
 
         # Connect cameras
         logger.info("\n===== [CAM] Initializing Cameras =====")
@@ -65,6 +67,25 @@ class Franka(Robot):
             logger.info(f"[INFO] {self.name} env initialized. Control: {self.config.control_mode}, Execute: {self.config.execute_mode}\n")
         else:
             logger.info(f"[INFO] {self.name} env initialized. Control: {self.config.control_mode}\n")
+
+    def _start_robot_controller_for_current_mode(self) -> None:
+        """Start the Flexiv control mode required by the configured action path."""
+        if self.config.control_mode in ["spacemouse", "oculus"] and self.config.execute_mode != "joint":
+            self._robot.robot_start_cartesian_impedance_control(None, None)
+            self._active_robot_controller = "cartesian"
+        else:
+            self._robot.robot_start_joint_impedance_control()
+            self._active_robot_controller = "joint"
+
+    def _ensure_cartesian_controller(self) -> None:
+        if self._active_robot_controller != "cartesian":
+            self._robot.robot_start_cartesian_impedance_control(None, None)
+            self._active_robot_controller = "cartesian"
+
+    def _ensure_joint_controller(self) -> None:
+        if self._active_robot_controller != "joint":
+            self._robot.robot_start_joint_impedance_control()
+            self._active_robot_controller = "joint"
 
 
     def _check_gripper_connection(self, robot_ip: str):
@@ -85,10 +106,11 @@ class Franka(Robot):
                 port=4242,
                 network_interface=self.config.network_interface,
                 gripper_name=self.config.gripper_name,
+                gripper_init=self.config.gripper_init,
+                gripper_init_wait_sec=self.config.gripper_init_wait_sec,
                 command_frequency=self.config.command_frequency,
                 home_plan=self.config.home_plan,
             )
-            franka.robot_start_joint_impedance_control()
 
             joint_positions = franka.robot_get_joint_positions()
             if joint_positions is not None and len(joint_positions) == 7:
@@ -274,7 +296,7 @@ class Franka(Robot):
             except Exception as e:
                 logger.warning(f"[ROBOT] isoteleop action failed: {e}, trying to restart controller...")
                 try:
-                    self._robot.robot_start_joint_impedance_control()
+                    self._ensure_joint_controller()
                 except Exception as e2:
                     logger.error(f"[ROBOT] Failed to restart controller: {e2}")
         
@@ -309,11 +331,11 @@ class Franka(Robot):
                     force=self._gripper_force,
                     blocking=True
                 )
-                self._robot.robot_start_joint_impedance_control()
+                self._start_robot_controller_for_current_mode()
             except Exception as e:
                 logger.warning(f"[ROBOT] Reset failed: {e}, trying to restart controller...")
                 try:
-                    self._robot.robot_start_joint_impedance_control()
+                    self._start_robot_controller_for_current_mode()
                 except Exception as e2:
                     logger.error(f"[ROBOT] Failed to restart controller: {e2}")
             return
@@ -339,6 +361,14 @@ class Franka(Robot):
                 ee_pose = self._robot.robot_get_ee_pose()
             except Exception as e:
                 logger.warning(f"[ROBOT] Failed to get ee pose: {e}")
+                if "gripper_cmd_bin" in action:
+                    self._handle_gripper(action["gripper_cmd_bin"], is_binary=True)
+                return
+
+            try:
+                self._ensure_cartesian_controller()
+            except Exception as e:
+                logger.warning(f"[ROBOT] Failed to start Cartesian controller: {e}")
                 if "gripper_cmd_bin" in action:
                     self._handle_gripper(action["gripper_cmd_bin"], is_binary=True)
                 return
@@ -414,11 +444,11 @@ class Franka(Robot):
                     force=self._gripper_force,
                     blocking=True
                 )
-                self._robot.robot_start_joint_impedance_control()
+                self._ensure_joint_controller()
             except Exception as e:
                 logger.warning(f"[ROBOT] Reset failed: {e}, trying to restart controller...")
                 try:
-                    self._robot.robot_start_joint_impedance_control()
+                    self._ensure_joint_controller()
                 except Exception as e2:
                     logger.error(f"[ROBOT] Failed to restart controller: {e2}")
             return
@@ -435,6 +465,7 @@ class Franka(Robot):
 
         if not self.config.debug:
             try:
+                self._ensure_joint_controller()
                 current_joints = self._robot.robot_get_joint_positions()
                 max_delta = np.abs(current_joints - target_joints).max()
                 
@@ -453,7 +484,7 @@ class Franka(Robot):
             except Exception as e:
                 logger.warning(f"[ROBOT] Joint action failed: {e}, trying to restart controller...")
                 try:
-                    self._robot.robot_start_joint_impedance_control()
+                    self._ensure_joint_controller()
                 except Exception as e2:
                     logger.error(f"[ROBOT] Failed to restart controller: {e2}")
         

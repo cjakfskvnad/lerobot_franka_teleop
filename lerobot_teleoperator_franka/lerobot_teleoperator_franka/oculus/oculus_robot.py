@@ -1,5 +1,6 @@
 from typing import Dict, Optional, Sequence, Tuple
 import logging
+import time
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
@@ -58,11 +59,18 @@ class OculusRobot(Robot):
         ik_ori_weight: float = 0.5,
         ik_joints_weight: float = 0.2,
         ik_regularization: float = 1e-4,
+        log_actions: bool = False,
+        log_action_period_sec: float = 0.2,
     ):  
         self._oculus_reader = OculusReader(ip_address=ip)
         self._use_gripper = use_gripper
         self._pose_scaler = pose_scaler
         self._channel_signs = channel_signs
+        self._log_actions = log_actions
+        self._log_action_period_sec = log_action_period_sec
+        self._last_action_log_time = 0.0
+        self._last_rg_pressed = False
+        self._last_has_right_transform = False
         self._last_gripper_position = 1.0
         self._last_valid_action = np.zeros(7 if use_gripper else 6)
         self._prev_transform = None
@@ -272,6 +280,8 @@ class OculusRobot(Robot):
         
         rg_pressed = buttons.get('RG', False)
         a_pressed = buttons.get('A', False)
+        self._last_rg_pressed = rg_pressed
+        self._last_has_right_transform = 'r' in transforms
         
         delta_ee_pose = np.zeros(6)
         joint_positions = None
@@ -390,6 +400,22 @@ class OculusRobot(Robot):
         
         # Reset
         obs_dict["reset_requested"] = action["reset_requested"]
+
+        if self._log_actions:
+            now = time.monotonic()
+            if now - self._last_action_log_time >= self._log_action_period_sec:
+                delta = action["delta_ee_pose"]
+                print(
+                    "[OCULUS] "
+                    f"right_pose={self._last_has_right_transform} "
+                    f"RG={self._last_rg_pressed} "
+                    f"delta=({delta[0]:+.4f}, {delta[1]:+.4f}, {delta[2]:+.4f}, "
+                    f"{delta[3]:+.4f}, {delta[4]:+.4f}, {delta[5]:+.4f}) "
+                    f"gripper={action['gripper']:.3f} "
+                    f"reset={action['reset_requested']}",
+                    flush=True,
+                )
+                self._last_action_log_time = now
         
         return obs_dict
 
@@ -453,5 +479,3 @@ if __name__ == "__main__":
             
     except KeyboardInterrupt:
         print("\n\n===== Test Ended =====")
-
-
