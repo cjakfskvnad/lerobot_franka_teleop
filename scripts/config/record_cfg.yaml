@@ -111,8 +111,8 @@ record:
     push_to_hub: False # whether to push the dataset to your huggingface repo after recording
 
 replay:
-  dataset_name: babycare/milk_power_20260321_v03
-  episode_idx: 0 # episode index to replay
+  dataset_name: babycare/milk_power_2_20260520_v21
+  episode_idx: 1 # episode index to replay
   robot:
     ip: *ip
     # gripper_port: *gripper_port
