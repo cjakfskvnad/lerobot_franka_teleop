@@ -75,7 +75,10 @@ class RecordConfig:
         self.gripper_reverse: bool = robot["gripper_reverse"]
         self.gripper_bin_threshold: float = robot["gripper_bin_threshold"]
         self.gripper_max_open: float = robot.get("gripper_max_open", 0.08)
+        self.gripper_force: float = robot.get("gripper_force", 40.0)
+        self.gripper_always_grasp: bool = robot.get("gripper_always_grasp", False)
         self.execute_mode: str = robot.get("execute_mode", "ee_pose")  # "ee_pose" or "joint"
+        self.policy_io_schema: str = robot.get("policy_io_schema", "default")
         
         # Task config
         self.num_episodes: int = task.get("num_episodes", 1)
@@ -87,7 +90,7 @@ class RecordConfig:
         # Time config
         self.episode_time_sec: int = time.get("episode_time_sec", 60)
         self.reset_time_sec: int = time.get("reset_time_sec", 10)
-        self.save_mera_period: int = time.get("save_mera_period", 1)
+        self.save_mera_period: int = time.get("save_meta_period", time.get("save_mera_period", 1))
         
         # Cameras config
         self.cameras_enabled: bool = cam.get("enabled", True)
@@ -268,8 +271,15 @@ def run_record(record_cfg: RecordConfig):
                                             use_depth=False,
                                             rotation=Cv2Rotation.NO_ROTATION)
 
-            # Create the robot and teleoperator configurations
-            camera_config = {"wrist_image": wrist_image_cfg, "exterior_image": exterior_image_cfg}
+            # Create the robot and teleoperator configurations. The TDK policy was
+            # trained with camera keys that include the RealSense serial numbers.
+            if record_cfg.policy_io_schema == "tdk_pose_joint":
+                camera_config = {
+                    f"camera_0_{record_cfg.wrist_cam_serial}": wrist_image_cfg,
+                    f"camera_1_{record_cfg.exterior_cam_serial}": exterior_image_cfg,
+                }
+            else:
+                camera_config = {"wrist_image": wrist_image_cfg, "exterior_image": exterior_image_cfg}
         else:
             camera_config = {}
         
@@ -292,8 +302,11 @@ def run_record(record_cfg: RecordConfig):
             gripper_reverse = record_cfg.gripper_reverse,
             gripper_bin_threshold = record_cfg.gripper_bin_threshold,
             gripper_max_open = record_cfg.gripper_max_open,
+            gripper_force = record_cfg.gripper_force,
+            gripper_always_grasp = record_cfg.gripper_always_grasp,
             control_mode = record_cfg.control_mode,
             execute_mode = record_cfg.execute_mode,
+            policy_io_schema = record_cfg.policy_io_schema,
         )
         # Initialize the robot
         robot = Franka(robot_config)

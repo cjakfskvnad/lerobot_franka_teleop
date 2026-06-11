@@ -43,6 +43,16 @@ import builtins
 import os
 
 from pathlib import Path
+import PIL.ExifTags
+import PIL.Image
+
+if not hasattr(PIL.ExifTags, "Base"):
+    class _PillowExifBase:
+        Orientation = 274
+
+    PIL.ExifTags.Base = _PillowExifBase
+if not hasattr(PIL.Image, "ExifTags"):
+    PIL.Image.ExifTags = PIL.ExifTags
 
 import datetime as dt
 import draccus
@@ -58,6 +68,44 @@ from lerobot.optim.schedulers import LRSchedulerConfig
 from lerobot.utils.hub import HubMixin
 
 TRAIN_CONFIG_NAME = "train_config.json"
+
+
+class TimedDataset(torch.utils.data.Dataset):
+    """Dataset wrapper that accumulates __getitem__ timing in the main process."""
+
+    def __init__(self, dataset):
+        self.dataset = dataset
+        self.reset_timing()
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        start_time = time.perf_counter()
+        item = self.dataset[index]
+        elapsed = time.perf_counter() - start_time
+        self.getitem_total_s += elapsed
+        self.getitem_count += 1
+        self.getitem_max_s = max(self.getitem_max_s, elapsed)
+        return item
+
+    def __getattr__(self, name):
+        return getattr(self.dataset, name)
+
+    def reset_timing(self):
+        self.getitem_total_s = 0.0
+        self.getitem_count = 0
+        self.getitem_max_s = 0.0
+
+    def pop_timing(self):
+        timing = {
+            "total_s": self.getitem_total_s,
+            "count": self.getitem_count,
+            "max_s": self.getitem_max_s,
+        }
+        self.reset_timing()
+        return timing
+
 
 class TrainPipelineConfig(HubMixin):
     def __init__(self, cfg: Dict[str, Any]):
@@ -166,11 +214,9 @@ class TrainPipelineConfig(HubMixin):
             else:
                 self.job_name = f"{self.env.type}_{self.policy.type}"
 
-        if not self.resume and isinstance(self.output_dir, Path) and self.output_dir.is_dir():
-            raise FileExistsError(
-                f"Output directory {self.output_dir} already exists and resume is {self.resume}. "
-                f"Please change your output directory so that {self.output_dir} is not overwritten."
-            )
+        if not self.resume and self.output_dir:
+            now = dt.datetime.now()
+            self.output_dir = self.output_dir / f"{now:%Y%m%d_%H%M%S_%f}"
         elif not self.output_dir:
             now = dt.datetime.now()
             train_dir = f"{now:%Y-%m-%d}/{now:%H-%M-%S}_{self.job_name}"
@@ -355,34 +401,46 @@ def update_policy(
     policy.train()
 
     # Let accelerator handle mixed precision
+    forward_start = time.perf_counter()
     with accelerator.autocast():
         loss, output_dict = policy.forward(batch)
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
+    train_metrics.forward_s = time.perf_counter() - forward_start
 
     # Use accelerator's backward method
+    backward_start = time.perf_counter()
     accelerator.backward(loss)
+    train_metrics.backward_s = time.perf_counter() - backward_start
 
     # Clip gradients if specified
+    grad_clip_start = time.perf_counter()
     if grad_clip_norm > 0:
         grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
     else:
         grad_norm = torch.nn.utils.clip_grad_norm_(
             policy.parameters(), float("inf"), error_if_nonfinite=False
         )
+    train_metrics.grad_clip_s = time.perf_counter() - grad_clip_start
 
     # Optimizer step
+    optimizer_start = time.perf_counter()
     with lock if lock is not None else nullcontext():
         optimizer.step()
 
     optimizer.zero_grad()
+    train_metrics.optimizer_s = time.perf_counter() - optimizer_start
 
     # Step through pytorch scheduler at every batch instead of epoch
+    scheduler_start = time.perf_counter()
     if lr_scheduler is not None:
         lr_scheduler.step()
+    train_metrics.scheduler_s = time.perf_counter() - scheduler_start
 
     # Update internal buffers if policy has update method
+    policy_update_start = time.perf_counter()
     if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
+    train_metrics.policy_update_s = time.perf_counter() - policy_update_start
 
     train_metrics.loss = loss.item()
     train_metrics.grad_norm = grad_norm.item()
@@ -556,8 +614,23 @@ def run_train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         shuffle = True
         sampler = None
 
+    dataloader_dataset = TimedDataset(dataset) if cfg.num_workers == 0 else dataset
+    if is_main_process:
+        if cfg.num_workers == 0:
+            logging.info(
+                "Step timing enabled: data_s=dl_next_s+prep_s, "
+                "dl_next_s=DataLoader next(batch), prep_s=preprocessor(batch), "
+                "getitem_s=sum(dataset.__getitem__), getitem_max_s=slowest sample in batch"
+            )
+        else:
+            logging.info(
+                "Step timing enabled: data_s=dl_next_s+prep_s, "
+                "dl_next_s=DataLoader next(batch), prep_s=preprocessor(batch). "
+                "getitem_s is unavailable when num_workers > 0."
+            )
+
     dataloader = torch.utils.data.DataLoader(
-        dataset,
+        dataloader_dataset,
         num_workers=cfg.num_workers,
         batch_size=cfg.batch_size,
         shuffle=shuffle and not cfg.dataset.streaming,
@@ -582,6 +655,17 @@ def run_train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         "lr": AverageMeter("lr", ":0.1e"),
         "update_s": AverageMeter("updt_s", ":.3f"),
         "dataloading_s": AverageMeter("data_s", ":.3f"),
+        "dataloader_next_s": AverageMeter("dl_next_s", ":.3f"),
+        "preprocess_s": AverageMeter("prep_s", ":.3f"),
+        "dataset_getitem_s": AverageMeter("getitem_s", ":.3f"),
+        "dataset_getitem_max_s": AverageMeter("getitem_max_s", ":.3f"),
+        "dataset_getitem_count": AverageMeter("getitem_n", ":.0f"),
+        "forward_s": AverageMeter("fwd_s", ":.3f"),
+        "backward_s": AverageMeter("bwd_s", ":.3f"),
+        "grad_clip_s": AverageMeter("clip_s", ":.3f"),
+        "optimizer_s": AverageMeter("optim_s", ":.3f"),
+        "scheduler_s": AverageMeter("sched_s", ":.3f"),
+        "policy_update_s": AverageMeter("polupd_s", ":.3f"),
     }
 
     # Use effective batch size for proper epoch calculation in distributed training
@@ -600,9 +684,26 @@ def run_train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
+
+        dataloader_start = time.perf_counter()
         batch = next(dl_iter)
+        dataloader_next_s = time.perf_counter() - dataloader_start
+
+        if isinstance(dataloader_dataset, TimedDataset):
+            dataset_timing = dataloader_dataset.pop_timing()
+        else:
+            dataset_timing = {"total_s": 0.0, "count": 0, "max_s": 0.0}
+
+        preprocess_start = time.perf_counter()
         batch = preprocessor(batch)
+        preprocess_s = time.perf_counter() - preprocess_start
+
         train_tracker.dataloading_s = time.perf_counter() - start_time
+        train_tracker.dataloader_next_s = dataloader_next_s
+        train_tracker.preprocess_s = preprocess_s
+        train_tracker.dataset_getitem_s = dataset_timing["total_s"]
+        train_tracker.dataset_getitem_max_s = dataset_timing["max_s"]
+        train_tracker.dataset_getitem_count = dataset_timing["count"]
 
         train_tracker, output_dict = update_policy(
             train_tracker,

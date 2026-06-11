@@ -1,14 +1,14 @@
 record:
-  repo_id: &repo_id "babycare/milk_power_2" 
+  repo_id: &repo_id "flexiv/eval_act_teleop_dataset_after_20260609_165330" 
   # repo_id: &repo_id "PhysBrain/PnP_Veg" 
   # repo_id: &repo_id "scylearning/pick_greencube_into_trashb
   # Suggested format: <hf_username>/<description>, description = task.description -> Verb_SourceObject_prep_TargetObject
   # e.g. Pick up the green cube and put it into the trash bin -> pick_greencube_into_trashbin
   debug: 0 # if True, robot will not execute any actions, but gripper can still be controlled
   user_notes:  # any additional notes about the dataset
-  fps: 15 # dataset and camera frame rate
+  fps: 30 # dataset and camera frame rate
   control_mode: &control_mode "oculus" # "isoteleop" or "spacemouse" or "oculus"
-  run_mode: "run_record" # "run_record" or "run_policy" or "run_mix"
+  run_mode: "run_policy" # "run_record" or "run_policy" or "run_mix"
 
   teleop:
     control_mode: *control_mode 
@@ -32,7 +32,7 @@ record:
       use_gripper: *use_gripper
       log_actions: true
       log_action_period_sec: 0.2
-      pose_scaler: [1.0, 0.8]  # scaler for oculus actions [position, attitude]
+      pose_scaler: [3.0, 1.5]  # scaler for oculus actions [position, attitude]
       channel_signs: [1, 1, 1, -1, -1, 1]  # signs for each axis [x, y, z, rx, ry, rz]
       # channel_signs: [-1, -1, 1, 1, 1, 1] # mirror
     placo:
@@ -73,15 +73,18 @@ record:
     # gripper_port: &gripper_port "/dev/franka_left_gripper" # gripper_port
     gripper_reverse: false  # If gripper moves opposite, flip this value
     gripper_max_open: 0.1 # Flexiv-GN01 max open width in meters
+    gripper_force: 40.0 # Flexiv gripper Grasp(force) / Move(..., force) in newtons
+    gripper_always_grasp: true # Keep calling Grasp(40) instead of opening/closing by position
     # Execute mode for oculus control: "ee_pose" (cartesian impedance) or "joint" (joint impedance via Placo IK)
-    execute_mode: "ee_pose"
+    execute_mode: "joint"
+    policy_io_schema: "tdk_pose_joint" # Match Flexiv TDK pose+joint policy IO schema
 
   policy:
     type: "act"  # 策略类型 (act, diffusion)
     device: "cuda"  # 运行设备 (cuda, cpu)
     push_to_hub: False  # 禁用模型推送
     # pretrained_path: "/home/deepcybo/lerobot/franka_workspace/outputs/lihao-test-0310/diffusion_test1/checkpoints/last/pretrained_model"
-    pretrained_path: "/home/deepcybo/lerobot/franka_workspace/outputs/zhonghuai/lajiao_20260318_merged/act_test2/checkpoints/last/pretrained_model"
+    pretrained_path: "/home/deepcybo/桌面/flexiv_rdk_v1.9/outputs/flexiv/act_teleop_dataset_after_20260609_165330/20260610_185059_632063/checkpoints/last/pretrained_model"
     # pretrained_path: "/home/deepcybo/lerobot/franka_workspace/outputs/lihao-test/act_test3/checkpoints/020000/pretrained_model"  
     # 预训练模型路径下要包括config.json
 
@@ -101,18 +104,18 @@ record:
     save_meta_period: 1 # Save metadata after every N episodes
 
   cameras:
-    enabled: false # Set true when RealSense cameras are connected
-    wrist_cam_serial: "317422075656" # wrist camera serial number 243222071212 344322074412
-    exterior_cam_serial: "243322071821" # exterior camera serial number 243322071821 339322074423
-    width: 424 # 640 424
-    height: 240 # 360 240
+    enabled: true # Set true when RealSense cameras are connected
+    wrist_cam_serial: "347622074732" # camera_0 in the training dataset
+    exterior_cam_serial: "346522071325" # camera_1 in the training dataset
+    width: 640 # 640 424
+    height: 480 # 480 360 240
 
   storage:
     push_to_hub: False # whether to push the dataset to your huggingface repo after recording
 
 replay:
-  dataset_name: babycare/milk_power_2_20260520_v21
-  episode_idx: 1 # episode index to replay
+  dataset_name: babycare/milk_power_2_20260520_v25
+  episode_idx: 0 # episode index to replay
   robot:
     ip: *ip
     # gripper_port: *gripper_port

@@ -16,6 +16,25 @@ from lerobot.cameras.realsense.camera_realsense import RealSenseCameraConfig
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+TDK_POSE_JOINT_NAMES = [
+    "follower_tcp_pose_x",
+    "follower_tcp_pose_y",
+    "follower_tcp_pose_z",
+    "follower_tcp_pose_qw",
+    "follower_tcp_pose_qx",
+    "follower_tcp_pose_qy",
+    "follower_tcp_pose_qz",
+    "follower_q_0",
+    "follower_q_1",
+    "follower_q_2",
+    "follower_q_3",
+    "follower_q_4",
+    "follower_q_5",
+    "follower_q_6",
+]
+
+
 class Franka(Robot):
     config_class = FrankaConfig
     name = "franka"
@@ -30,7 +49,8 @@ class Franka(Robot):
         self._initial_pose = None
         self._prev_observation = None
         self._num_joints = 7
-        self._gripper_force = 20
+        self._gripper_force = float(config.gripper_force)
+        self._gripper_always_grasp = bool(config.gripper_always_grasp)
         self._gripper_speed = 0.2
         self._gripper_epsilon = 1.0
         self._gripper_position = 1
@@ -54,6 +74,7 @@ class Franka(Robot):
             self._gripper = self._check_gripper_connection(self.config.robot_ip)
 
         self._start_robot_controller_for_current_mode()
+        self._apply_gripper_grasp_hold()
 
         # Connect cameras
         logger.info("\n===== [CAM] Initializing Cameras =====")
@@ -91,10 +112,32 @@ class Franka(Robot):
     def _check_gripper_connection(self, robot_ip: str):
         logger.info("\n===== [GRIPPER] Initializing gripper...")
         self._robot.gripper_initialize()
-        print("Homing gripper")
-        self._robot.gripper_goto(width=self.config.gripper_max_open, speed=self._gripper_speed, force=self._gripper_force, blocking=True)
+        if self._gripper_always_grasp:
+            self._apply_gripper_grasp_hold()
+        else:
+            print("Homing gripper")
+            self._robot.gripper_goto(
+                width=self.config.gripper_max_open,
+                speed=self._gripper_speed,
+                force=self._gripper_force,
+                blocking=True,
+            )
         logger.info("===== [GRIPPER] Gripper initialized successfully.\n")
         return None
+
+    def _apply_gripper_grasp_hold(self) -> None:
+        if not self.config.use_gripper or not self._gripper_always_grasp or self._robot is None:
+            return
+        try:
+            logger.info(f"[GRIPPER] Holding grasp force at {self._gripper_force:.1f} N")
+            self._robot.gripper_grasp(
+                speed=self._gripper_speed,
+                force=self._gripper_force,
+                blocking=False,
+            )
+            self._last_gripper_position = 0.0
+        except Exception as e:
+            logger.warning(f"[GRIPPER] Failed to hold grasp force: {e}")
 
 
     def _check_franka_connection(self, robot_ip: str):
@@ -152,18 +195,24 @@ class Franka(Robot):
         else:
             print(f"\nExecuting home plan: {self.config.home_plan} ...\n")
             self._robot.robot_go_home()
-        self._robot.gripper_goto(
-            width=self.config.gripper_max_open,
-            speed=self._gripper_speed,
-            force=self._gripper_force,
-            blocking=True
-        )
+        if self._gripper_always_grasp:
+            self._apply_gripper_grasp_hold()
+        else:
+            self._robot.gripper_goto(
+                width=self.config.gripper_max_open,
+                speed=self._gripper_speed,
+                force=self._gripper_force,
+                blocking=True
+            )
         # self._robot.gripper_goto(width=self.config.gripper_max_open, speed=self._gripper_speed, force=self._gripper_force, blocking=True)
         logger.info("===== [ROBOT] Robot reset successfully =====\n")
 
 
     @property
     def _motors_ft(self) -> dict[str, type]:
+        if self.config.policy_io_schema == "tdk_pose_joint":
+            return {name: float for name in TDK_POSE_JOINT_NAMES}
+
         return {
             # joint positions
             "joint_1.pos": float,
@@ -205,6 +254,9 @@ class Franka(Robot):
     @property
     def action_features(self) -> dict[str, type]:
         """Return action features based on control mode."""
+        if self.config.policy_io_schema == "tdk_pose_joint":
+            return {name: float for name in TDK_POSE_JOINT_NAMES}
+
         if self.config.control_mode == "isoteleop":
             features = {}
             for i in range(self._num_joints):
@@ -231,6 +283,9 @@ class Franka(Robot):
     def _handle_gripper(self, gripper_value: float, is_binary: bool = True) -> None:
         """Handle gripper control with common logic."""
         if not self.config.use_gripper:
+            return
+        if self._gripper_always_grasp:
+            self._apply_gripper_grasp_hold()
             return
         
         if is_binary:
@@ -261,7 +316,11 @@ class Franka(Robot):
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
-        
+
+        if self.config.policy_io_schema == "tdk_pose_joint":
+            self._send_action_tdk_pose_joint(action)
+            return action
+
         if self.config.control_mode == "isoteleop":
             self._send_action_isoteleop(action)
         elif self.config.control_mode == "spacemouse":
@@ -422,6 +481,60 @@ class Franka(Robot):
         if "gripper_cmd_bin" in action:
             self._handle_gripper(action["gripper_cmd_bin"], is_binary=True)
 
+    def _send_action_tdk_pose_joint(self, action: dict[str, Any]) -> None:
+        """Execute policy actions trained from Flexiv TDK pose+joint datasets."""
+        if self.config.execute_mode == "ee_pose":
+            quat_wxyz = np.array(
+                [
+                    action["follower_tcp_pose_qw"],
+                    action["follower_tcp_pose_qx"],
+                    action["follower_tcp_pose_qy"],
+                    action["follower_tcp_pose_qz"],
+                ],
+                dtype=float,
+            )
+            quat_norm = np.linalg.norm(quat_wxyz)
+            if quat_norm < 1e-6:
+                logger.warning("[ROBOT] Invalid zero quaternion from policy, skipping action")
+                return
+            quat_wxyz /= quat_norm
+            quat_xyzw = [quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]]
+            rotvec = R.from_quat(quat_xyzw).as_rotvec()
+            target_ee_pose = np.array(
+                [
+                    action["follower_tcp_pose_x"],
+                    action["follower_tcp_pose_y"],
+                    action["follower_tcp_pose_z"],
+                    *rotvec,
+                ],
+                dtype=float,
+            )
+            if not self.config.debug:
+                try:
+                    self._ensure_cartesian_controller()
+                    self._robot.robot_update_desired_ee_pose(target_ee_pose)
+                except Exception as e:
+                    logger.warning(f"[ROBOT] TDK Cartesian action failed: {e}")
+            return
+
+        target_joints = np.array([action[f"follower_q_{i}"] for i in range(self._num_joints)])
+        if not self.config.debug:
+            try:
+                self._ensure_joint_controller()
+                current_joints = self._robot.robot_get_joint_positions()
+                max_delta = np.abs(current_joints - target_joints).max()
+                if max_delta > 1.5:
+                    logger.warning(f"[ROBOT] Joint delta too large ({max_delta:.3f} rad), skipping for safety")
+                elif max_delta > 0.1:
+                    steps = min(max(int(max_delta / 0.02), 5), 200)
+                    for jnt in np.linspace(current_joints, target_joints, steps):
+                        self._robot.robot_update_desired_joint_positions(jnt)
+                        time.sleep(0.01)
+                else:
+                    self._robot.robot_update_desired_joint_positions(target_joints)
+            except Exception as e:
+                logger.warning(f"[ROBOT] TDK joint action failed: {e}")
+
     def _send_action_oculus_joint(self, action: dict[str, Any]) -> None:
         """Send action in oculus mode using joint positions from Placo IK.
         
@@ -509,6 +622,29 @@ class Franka(Robot):
                 return self._prev_observation
             else:
                 raise
+
+        if self.config.policy_io_schema == "tdk_pose_joint":
+            quat_xyzw = R.from_rotvec(ee_pose[3:]).as_quat()
+            obs_dict = {
+                "follower_tcp_pose_x": float(ee_pose[0]),
+                "follower_tcp_pose_y": float(ee_pose[1]),
+                "follower_tcp_pose_z": float(ee_pose[2]),
+                "follower_tcp_pose_qw": float(quat_xyzw[3]),
+                "follower_tcp_pose_qx": float(quat_xyzw[0]),
+                "follower_tcp_pose_qy": float(quat_xyzw[1]),
+                "follower_tcp_pose_qz": float(quat_xyzw[2]),
+            }
+            for i in range(len(joint_position)):
+                obs_dict[f"follower_q_{i}"] = float(joint_position[i])
+
+            for cam_key, cam in self.cameras.items():
+                start = time.perf_counter()
+                obs_dict[cam_key] = cam.read()
+                dt_ms = (time.perf_counter() - start) * 1e3
+                logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
+
+            self._prev_observation = obs_dict
+            return obs_dict
 
         # Prepare observation dictionary
         obs_dict = {}
