@@ -6,13 +6,13 @@ train:
   env:
 
   policy:
-    type: "act"
+    type: "diffusion"
     device: "cuda"
-    repo_id: "flexiv/act_teleop_0616_0617"
+    repo_id: "flexiv/diffusion_teleop_0616_0617"
     push_to_hub: false  # 禁用模型推送
 
-  output_dir: "outputs/flexiv/act_teleop_0616_0617"
-  job_name: "act_flexiv_teleop_0616_0617"
+  output_dir: "outputs/flexiv/diffusion_teleop_0616_0617"
+  job_name: "diffusion_flexiv_teleop_0616_0617"
 
   resume: false
   seed: 1000
@@ -33,6 +33,7 @@ train:
 
   wandb: 
     enable: True
+    disable_artifact: True
     project: "lerobot"
     # entity: "your-wandb-username"  # 改为您的 WandB 用户名，或注释掉使用默认
     # notes: "训练备注"
