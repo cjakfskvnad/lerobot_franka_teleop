@@ -207,6 +207,21 @@ class Franka(Robot):
         # self._robot.gripper_goto(width=self.config.gripper_max_open, speed=self._gripper_speed, force=self._gripper_force, blocking=True)
         logger.info("===== [ROBOT] Robot reset successfully =====\n")
 
+    def movej_to_joint_positions_deg(
+        self,
+        positions_deg: list[float],
+        velocity: float = 0.2,
+        timeout: float = 120.0,
+    ) -> None:
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self.name} is not connected.")
+
+        self._robot.robot_movej_to_joint_positions_deg(
+            positions_deg,
+            velocity=velocity,
+            timeout=timeout,
+        )
+
 
     @property
     def _motors_ft(self) -> dict[str, type]:

@@ -255,6 +255,35 @@ class FrankaInterfaceClient:
         while self.robot.busy():
             time.sleep(0.2)
 
+    def robot_movej_to_joint_positions_deg(
+        self,
+        positions_deg: Iterable[float],
+        velocity: float = 0.2,
+        timeout: float = 120.0,
+    ):
+        target = self._as_list(positions_deg)
+        if len(target) != 7:
+            raise ValueError(f"MoveJ target must contain 7 arm joints, got {len(target)}")
+
+        self._switch_mode(self._mode.NRT_PRIMITIVE_EXECUTION)
+        self.robot.ExecutePrimitive(
+            "MoveJ",
+            {
+                "target": self._flexivrdk.JPos(target),
+                "vel": float(velocity),
+            },
+        )
+
+        start_time = time.monotonic()
+        while True:
+            if self.robot.fault():
+                raise RuntimeError("Fault occurred on Flexiv robot during MoveJ")
+            if self.robot.primitive_states().get("reachedTarget", False):
+                return
+            if timeout > 0 and time.monotonic() - start_time > timeout:
+                raise TimeoutError(f"MoveJ primitive did not finish within {timeout} seconds")
+            time.sleep(0.2)
+
     def robot_move_to_ee_pose(
         self,
         pose: np.ndarray,

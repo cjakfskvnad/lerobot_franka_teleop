@@ -2,6 +2,8 @@ import time
 import yaml
 import logging
 logging.basicConfig(level=logging.WARNING, format="%(message)s")
+import json
+import math
 from pathlib import Path
 from typing import Dict, Any
 from lerobot_robot_franka import FrankaConfig, Franka
@@ -34,8 +36,46 @@ class ReplayConfig:
         self.gripper_reverse: bool = robot.get("gripper_reverse", False)
         self.gripper_bin_threshold: float = robot.get("gripper_bin_threshold", 0.98)
         self.gripper_max_open: float = robot.get("gripper_max_open", 0.08)
+        self.gripper_force: float = robot.get("gripper_force", 40.0)
+        self.gripper_always_grasp: bool = robot.get("gripper_always_grasp", False)
         self.control_mode: str = cfg.get("control_mode", robot.get("control_mode", "isoteleop"))
         self.execute_mode: str = robot.get("execute_mode", "ee_pose")
+        self.policy_io_schema: str = robot.get("policy_io_schema", "default")
+        self.pre_replay_movej: bool = cfg.get("pre_replay_movej", True)
+        self.pre_replay_joint_pose_file: str = cfg.get(
+            "pre_replay_joint_pose_file",
+            str(Path(__file__).resolve().parents[3] / "example_py" / "saved_joint_pose.json"),
+        )
+        self.pre_replay_joint_positions: list[float] | None = cfg.get("pre_replay_joint_positions")
+        self.pre_replay_joint_unit: str = cfg.get("pre_replay_joint_unit", "rad")
+        self.pre_replay_movej_velocity: float = cfg.get("pre_replay_movej_velocity", 0.2)
+        self.pre_replay_movej_timeout: float = cfg.get("pre_replay_movej_timeout", 120.0)
+
+
+def _load_pre_replay_joints_deg(replay_cfg: ReplayConfig) -> list[float]:
+    if replay_cfg.pre_replay_joint_positions is not None:
+        joints = [float(v) for v in replay_cfg.pre_replay_joint_positions]
+        unit = replay_cfg.pre_replay_joint_unit
+    else:
+        pose_path = Path(replay_cfg.pre_replay_joint_pose_file).expanduser()
+        data = json.loads(pose_path.read_text(encoding="utf-8"))
+        if "q_deg" in data:
+            joints = [float(v) for v in data["q_deg"]]
+            unit = "deg"
+        elif "q_rad" in data:
+            joints = [float(v) for v in data["q_rad"]]
+            unit = "rad"
+        else:
+            raise ValueError(f"{pose_path} must contain q_deg or q_rad")
+
+    if len(joints) != 7:
+        raise ValueError(f"Pre-replay MoveJ target must contain 7 joints, got {len(joints)}")
+
+    if unit == "deg":
+        return joints
+    if unit == "rad":
+        return [math.degrees(v) for v in joints]
+    raise ValueError(f"Unsupported pre_replay_joint_unit: {unit}")
 
 def run_replay(replay_cfg: ReplayConfig):
     episode_idx = replay_cfg.episode_idx
@@ -55,8 +95,11 @@ def run_replay(replay_cfg: ReplayConfig):
         gripper_reverse=replay_cfg.gripper_reverse,
         gripper_bin_threshold=replay_cfg.gripper_bin_threshold,
         gripper_max_open=replay_cfg.gripper_max_open,
+        gripper_force=replay_cfg.gripper_force,
+        gripper_always_grasp=replay_cfg.gripper_always_grasp,
         control_mode=replay_cfg.control_mode,
         execute_mode=replay_cfg.execute_mode,
+        policy_io_schema=replay_cfg.policy_io_schema,
     )
 
     dataset = LeRobotDataset(replay_cfg.dataset_name)
@@ -70,6 +113,17 @@ def run_replay(replay_cfg: ReplayConfig):
     robot = Franka(robot_config)
     try:
         robot.connect()
+        if replay_cfg.pre_replay_movej:
+            target_deg = _load_pre_replay_joints_deg(replay_cfg)
+            logging.warning(
+                "Moving to pre-replay fixed joint pose with MoveJ: %s",
+                [round(v, 3) for v in target_deg],
+            )
+            robot.movej_to_joint_positions_deg(
+                target_deg,
+                velocity=replay_cfg.pre_replay_movej_velocity,
+                timeout=replay_cfg.pre_replay_movej_timeout,
+            )
         log_say(f"Replaying episode {episode_idx} ({len(episode_frame_indices)} frames)")
         for idx in episode_frame_indices:
             t0 = time.perf_counter()

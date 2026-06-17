@@ -1,5 +1,5 @@
 record:
-  repo_id: &repo_id "flexiv/eval_act_teleop_dataset_after_20260609_165330" 
+  repo_id: &repo_id "flexiv/eval_act_teleop_0616_0617" 
   # repo_id: &repo_id "PhysBrain/PnP_Veg" 
   # repo_id: &repo_id "scylearning/pick_greencube_into_trashb
   # Suggested format: <hf_username>/<description>, description = task.description -> Verb_SourceObject_prep_TargetObject
@@ -84,23 +84,22 @@ record:
     device: "cuda"  # 运行设备 (cuda, cpu)
     push_to_hub: False  # 禁用模型推送
     # pretrained_path: "/home/deepcybo/lerobot/franka_workspace/outputs/lihao-test-0310/diffusion_test1/checkpoints/last/pretrained_model"
-    pretrained_path: "/home/deepcybo/桌面/flexiv_rdk_v1.9/outputs/flexiv/act_teleop_dataset_after_20260609_165330/20260610_185059_632063/checkpoints/last/pretrained_model"
+    pretrained_path: "/home/deepcybo/桌面/flexiv_rdk_v1.9/outputs/flexiv/act_teleop_0616_0617/20260617_110313_672962/checkpoints/010000/pretrained_model"
     # pretrained_path: "/home/deepcybo/lerobot/franka_workspace/outputs/lihao-test/act_test3/checkpoints/020000/pretrained_model"  
     # 预训练模型路径下要包括config.json
 
   task:
-    # description: "Pick up the green cube and put it into the trash bin." # task description
-    description: "pick up the Shanghai Green and put them into the brown basket" # task description
+    description: "Flexiv transparent cartesian teleoperation" # task description
     # description: "pick up the red chili and put it into the brown basket" # task description
     # description: "pick up the red chili and put it into the brown basket"
-    num_episodes: 10 # number of episodes to record
+    num_episodes: 1 # number of episodes to record
     display: False # Whether to display the data during recording
     resume: false # whether to resume from an existing dataset
     resume_dataset: roboticiq/pick_all_yellow_cube_to_brown_basket_20260208_v01 # dataset to resume from if resume is True
   
   time:
-    episode_time_sec: 6000 # max time per episode in seconds
-    reset_time_sec: 6000 # max time to reset between episodes in seconds
+    episode_time_sec: 120 # max time per episode in seconds
+    reset_time_sec: 120 # max time to reset between episodes in seconds
     save_meta_period: 1 # Save metadata after every N episodes
 
   cameras:
@@ -114,10 +113,23 @@ record:
     push_to_hub: False # whether to push the dataset to your huggingface repo after recording
 
 replay:
-  dataset_name: babycare/milk_power_2_20260520_v25
+  dataset_name: flexiv/teleop_dataset_20260611_152426_episode_000002_video
   episode_idx: 0 # episode index to replay
+  pre_replay_movej: true
+  pre_replay_joint_pose_file: "/home/deepcybo/桌面/flexiv_rdk_v1.9/example_py/saved_joint_pose.json"
+  pre_replay_movej_velocity: 0.2
+  pre_replay_movej_timeout: 120.0
   robot:
-    ip: *ip
+    robot_sn: "Rizon4s-063425"
+    ip: "Rizon4s-063425"
+    network_interface: "192.168.2.112"
+    gripper_name: "Flexiv-GN01"
+    gripper_init: true
+    use_gripper: true
+    gripper_force: 40.0
+    gripper_always_grasp: true
+    execute_mode: "joint"
+    policy_io_schema: "tdk_pose_joint"
     # gripper_port: *gripper_port
   control_mode: *control_mode 
 

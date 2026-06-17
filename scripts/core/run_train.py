@@ -140,7 +140,7 @@ class TrainPipelineConfig(HubMixin):
             self.policy = DiffusionConfig(
                 device = policy["device"],
                 repo_id = policy["repo_id"],
-                push_to_hub = ["push_to_hub"]
+                push_to_hub = policy["push_to_hub"]
             )
         else:
             raise ValueError(f"no config for policy type: {policy_type}")
