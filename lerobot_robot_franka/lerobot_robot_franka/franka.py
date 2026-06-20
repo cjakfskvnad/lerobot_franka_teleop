@@ -39,6 +39,16 @@ TDK_GRIPPER_NAMES = [
     "follower_gripper_width",
 ]
 
+TDK_FORCE_XYZ_NAMES_BY_FRAME = {
+    "tcp": ["follower_ext_wrench_tcp_fx", "follower_ext_wrench_tcp_fy", "follower_ext_wrench_tcp_fz"],
+    "world": [
+        "follower_ext_wrench_world_fx",
+        "follower_ext_wrench_world_fy",
+        "follower_ext_wrench_world_fz",
+    ],
+    "raw": ["follower_ft_sensor_raw_fx", "follower_ft_sensor_raw_fy", "follower_ft_sensor_raw_fz"],
+}
+
 
 class Franka(Robot):
     config_class = FrankaConfig
@@ -249,6 +259,8 @@ class Franka(Robot):
             names = [*TDK_POSE_JOINT_NAMES]
             if self.config.use_gripper:
                 names.extend(TDK_GRIPPER_NAMES)
+            if self.config.include_force_observation:
+                names.extend(TDK_FORCE_XYZ_NAMES_BY_FRAME[self.config.force_observation_frame])
             return {name: float for name in names}
 
         return {
@@ -743,6 +755,16 @@ class Franka(Robot):
                     width = self._gripper_position * self.config.gripper_max_open
                 obs_dict["follower_gripper_width"] = width
                 obs_dict["follower_gripper_command"] = float(1.0 - self._last_gripper_position)
+
+            if self.config.include_force_observation:
+                force_names = TDK_FORCE_XYZ_NAMES_BY_FRAME[self.config.force_observation_frame]
+                try:
+                    force_xyz = self._robot.robot_get_force_xyz(self.config.force_observation_frame)
+                except Exception as e:
+                    logger.warning(f"[ROBOT] Failed to read Flexiv force observation: {e}")
+                    force_xyz = [0.0, 0.0, 0.0]
+                for name, value in zip(force_names, force_xyz):
+                    obs_dict[name] = float(value)
 
             for cam_key, cam in self.cameras.items():
                 start = time.perf_counter()

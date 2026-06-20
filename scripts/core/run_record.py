@@ -37,6 +37,16 @@ import logging
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
+FORCE_XYZ_NAMES_BY_FRAME = {
+    "tcp": ["follower_ext_wrench_tcp_fx", "follower_ext_wrench_tcp_fy", "follower_ext_wrench_tcp_fz"],
+    "world": [
+        "follower_ext_wrench_world_fx",
+        "follower_ext_wrench_world_fy",
+        "follower_ext_wrench_world_fz",
+    ],
+    "raw": ["follower_ft_sensor_raw_fx", "follower_ft_sensor_raw_fy", "follower_ft_sensor_raw_fz"],
+}
+
 
 def start_terminal_keyboard_listener(events: dict):
     """Fallback key listener for terminals where pynput cannot capture Esc/arrows."""
@@ -167,6 +177,59 @@ def load_saved_home_joints_rad(path: str | Path) -> list[float]:
     return joints
 
 
+def infer_force_frame(force_feature_names: list[str] | None) -> str:
+    if not force_feature_names:
+        return "tcp"
+    for frame, names in FORCE_XYZ_NAMES_BY_FRAME.items():
+        if list(force_feature_names) == names:
+            return frame
+    return "tcp"
+
+
+def apply_force_policy_overrides(policy_cfg, policy: Dict[str, Any]) -> None:
+    policy_cfg.force_xyz_enabled = True
+    policy_cfg.force_feature_names = policy.get(
+        "force_feature_names",
+        FORCE_XYZ_NAMES_BY_FRAME["tcp"],
+    )
+    policy_cfg.force_fourier_dim = policy.get("force_fourier_dim", 8)
+    policy_cfg.force_min_period = policy.get("force_min_period", 1e-3)
+    policy_cfg.force_max_period = policy.get("force_max_period", 1.0)
+
+
+def make_record_policy(record_cfg, dataset):
+    if not getattr(record_cfg.policy, "force_xyz_enabled", False):
+        return make_policy(record_cfg.policy, ds_meta=dataset.meta)
+
+    from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
+    from safetensors.torch import load_model as load_model_as_safetensor
+
+    from scripts.core.run_train import _install_force_xyz_act
+
+    pretrained_path = record_cfg.policy.pretrained_path
+    record_cfg.policy.pretrained_path = None
+    try:
+        policy = make_policy(record_cfg.policy, ds_meta=dataset.meta)
+        policy = _install_force_xyz_act(policy, dataset.meta, record_cfg.policy)
+    finally:
+        record_cfg.policy.pretrained_path = pretrained_path
+
+    if pretrained_path is not None:
+        model_file = Path(pretrained_path) / SAFETENSORS_SINGLE_FILE
+        if not model_file.exists():
+            raise FileNotFoundError(f"Expected policy weights at {model_file}")
+        missing_keys, unexpected_keys = load_model_as_safetensor(policy, str(model_file), strict=False)
+        logging.info(
+            "Loaded act_force_xyz weights from %s (missing=%s, unexpected=%s)",
+            model_file,
+            list(missing_keys),
+            list(unexpected_keys),
+        )
+        policy.to(record_cfg.policy.device)
+
+    return policy
+
+
 class RecordConfig:
     """Configuration class for recording sessions."""
     
@@ -221,6 +284,17 @@ class RecordConfig:
         self.gripper_always_grasp: bool = robot.get("gripper_always_grasp", False)
         self.execute_mode: str = robot.get("execute_mode", "ee_pose")  # "ee_pose" or "joint"
         self.policy_io_schema: str = robot.get("policy_io_schema", "default")
+        self.include_force_observation: bool = robot.get(
+            "include_force_observation",
+            bool(getattr(self.policy, "force_xyz_enabled", False)),
+        )
+        inferred_force_frame = infer_force_frame(getattr(self.policy, "force_feature_names", None))
+        self.force_observation_frame: str = robot.get("force_observation_frame", inferred_force_frame)
+        if self.force_observation_frame not in FORCE_XYZ_NAMES_BY_FRAME:
+            raise ValueError(
+                f"Unsupported force_observation_frame {self.force_observation_frame!r}; "
+                f"expected one of {sorted(FORCE_XYZ_NAMES_BY_FRAME)}"
+            )
         
         # Task config
         self.num_episodes: int = task.get("num_episodes", 1)
@@ -294,10 +368,11 @@ class RecordConfig:
         """Parse policy configuration."""
         policy_type = policy["type"]
         pretrained_path = policy.get("pretrained_path")
+        force_policy = policy_type == "act_force_xyz"
 
         if pretrained_path:
             self.policy = PreTrainedConfig.from_pretrained(pretrained_path)
-            if self.policy.type != policy_type:
+            if self.policy.type != policy_type and not (force_policy and self.policy.type == "act"):
                 raise ValueError(
                     f"Configured policy type {policy_type!r} does not match pretrained policy "
                     f"type {self.policy.type!r} in {pretrained_path}"
@@ -305,14 +380,18 @@ class RecordConfig:
             self.policy.device = policy["device"]
             self.policy.push_to_hub = policy["push_to_hub"]
             self.policy.pretrained_path = pretrained_path
+            if force_policy:
+                apply_force_policy_overrides(self.policy, policy)
             return
 
-        if policy_type == "act":
+        if policy_type in ["act", "act_force_xyz"]:
             from lerobot.policies import ACTConfig
             self.policy = ACTConfig(
                 device=policy["device"],
                 push_to_hub=policy["push_to_hub"],
             )
+            if force_policy:
+                apply_force_policy_overrides(self.policy, policy)
         elif policy_type == "diffusion":
             from lerobot.policies import DiffusionConfig
             self.policy = DiffusionConfig(
@@ -460,6 +539,8 @@ def run_record(record_cfg: RecordConfig):
             control_mode = record_cfg.control_mode,
             execute_mode = record_cfg.execute_mode,
             policy_io_schema = record_cfg.policy_io_schema,
+            include_force_observation = record_cfg.include_force_observation,
+            force_observation_frame = record_cfg.force_observation_frame,
         )
         # Initialize the robot
         robot = Franka(robot_config)
@@ -509,11 +590,11 @@ def run_record(record_cfg: RecordConfig):
             policy = None
         elif record_cfg.run_mode == "run_policy":
             logging.info("====== [INFO] Running in policy mode ======")
-            policy = make_policy(record_cfg.policy, ds_meta=dataset.meta)
+            policy = make_record_policy(record_cfg, dataset)
             teleop = None
         elif record_cfg.run_mode == "run_mix":
             logging.info("====== [INFO] Running in mixed mode ======")
-            policy = make_policy(record_cfg.policy, ds_meta=dataset.meta)
+            policy = make_record_policy(record_cfg, dataset)
             teleop = create_teleop(teleop_config)
         
         if policy is not None:

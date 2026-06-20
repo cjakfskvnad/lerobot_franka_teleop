@@ -32,3 +32,5 @@ class FrankaConfig(RobotConfig):
     # "tdk_pose_joint" matches Flexiv TDK datasets:
     # [tcp pose qwxyz + 7 follower joint positions].
     policy_io_schema: str = "default"
+    include_force_observation: bool = False
+    force_observation_frame: str = "tcp"

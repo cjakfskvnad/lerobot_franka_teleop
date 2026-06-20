@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 import time
 from contextlib import nullcontext
 from pprint import pformat
@@ -10,6 +11,7 @@ from typing import Dict, Any
 import yaml
 
 import torch
+from torch import Tensor, nn
 from accelerate import Accelerator
 from termcolor import colored
 from torch.optim import Optimizer
@@ -68,6 +70,278 @@ from lerobot.optim.schedulers import LRSchedulerConfig
 from lerobot.utils.hub import HubMixin
 
 TRAIN_CONFIG_NAME = "train_config.json"
+DEFAULT_FORCE_XYZ_NAMES = (
+    ("follower_ext_wrench_tcp_fx", "follower_ext_wrench_tcp_fy", "follower_ext_wrench_tcp_fz"),
+    ("follower_ext_wrench_world_fx", "follower_ext_wrench_world_fy", "follower_ext_wrench_world_fz"),
+    ("follower_ext_wrench_tcp_x", "follower_ext_wrench_tcp_y", "follower_ext_wrench_tcp_z"),
+    ("follower_ext_wrench_world_x", "follower_ext_wrench_world_y", "follower_ext_wrench_world_z"),
+    ("ext_wrench_tcp_fx", "ext_wrench_tcp_fy", "ext_wrench_tcp_fz"),
+    ("ext_wrench_world_fx", "ext_wrench_world_fy", "ext_wrench_world_fz"),
+    ("force_x", "force_y", "force_z"),
+    ("fx", "fy", "fz"),
+)
+
+
+class FourierForceEncoder(nn.Module):
+    """Encode current XYZ force as one ACT transformer token."""
+
+    def __init__(
+        self,
+        force_dim: int,
+        output_dim: int,
+        fourier_dim: int = 8,
+        min_period: float = 1e-3,
+        max_period: float = 1.0,
+    ):
+        super().__init__()
+        if fourier_dim % 2 != 0:
+            raise ValueError(f"force_fourier_dim must be even, got {fourier_dim}")
+        self.force_dim = force_dim
+        self.fourier_dim = fourier_dim
+        self.min_period = min_period
+        self.max_period = max_period
+        in_dim = force_dim + force_dim * fourier_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, output_dim * 2),
+            nn.GELU(),
+            nn.Linear(output_dim * 2, output_dim * 2),
+            nn.GELU(),
+            nn.Linear(output_dim * 2, output_dim),
+        )
+
+    def forward(self, force_xyz: Tensor) -> Tensor:
+        if force_xyz.dim() != 2 or force_xyz.shape[-1] != self.force_dim:
+            raise ValueError(f"Expected force tensor shape (B, {self.force_dim}), got {tuple(force_xyz.shape)}")
+        force_xyz = force_xyz.to(dtype=torch.float32)
+        fraction = torch.linspace(
+            0.0,
+            1.0,
+            self.fourier_dim // 2,
+            dtype=force_xyz.dtype,
+            device=force_xyz.device,
+        )
+        period = self.min_period * (self.max_period / self.min_period) ** fraction
+        scale = (2.0 * math.pi) / period
+        sin_input = force_xyz.unsqueeze(-1) * scale
+        fourier = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=-1)
+        fourier = fourier.reshape(force_xyz.shape[0], -1)
+        return self.mlp(torch.cat([force_xyz, fourier], dim=-1))
+
+
+def _find_force_xyz_indices(state_names: list[str], requested_names: list[str] | None = None) -> tuple[list[int], list[str]]:
+    if requested_names:
+        missing = [name for name in requested_names if name not in state_names]
+        if missing:
+            raise ValueError(
+                f"Configured force_feature_names are missing from observation.state: {missing}. "
+                f"Available names: {state_names}"
+            )
+        return [state_names.index(name) for name in requested_names], requested_names
+
+    for candidate_names in DEFAULT_FORCE_XYZ_NAMES:
+        if all(name in state_names for name in candidate_names):
+            return [state_names.index(name) for name in candidate_names], list(candidate_names)
+
+    raise ValueError(
+        "Could not infer XYZ force columns from observation.state. "
+        "Set policy.force_feature_names in train_cfg.yaml, for example "
+        "['follower_ext_wrench_tcp_fx', 'follower_ext_wrench_tcp_fy', 'follower_ext_wrench_tcp_fz']. "
+        f"Available observation.state names: {state_names}"
+    )
+
+
+def _install_force_xyz_act(policy: PreTrainedPolicy, ds_meta, cfg_policy) -> PreTrainedPolicy:
+    from itertools import chain
+
+    import einops
+    import torchvision
+    from torchvision.models._utils import IntermediateLayerGetter
+    from torchvision.ops.misc import FrozenBatchNorm2d
+
+    from lerobot.policies.act.modeling_act import (
+        ACT,
+        ACTEncoder,
+        ACTDecoder,
+        ACTSinusoidalPositionEmbedding2d,
+        create_sinusoidal_pos_embedding,
+    )
+    from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+
+    state_feature = ds_meta.features.get(OBS_STATE)
+    if state_feature is None or "names" not in state_feature:
+        raise ValueError("act_force_xyz requires dataset meta feature 'observation.state' with named dimensions.")
+
+    force_names = getattr(cfg_policy, "force_feature_names", None)
+    force_indices, resolved_names = _find_force_xyz_indices(list(state_feature["names"]), force_names)
+    force_fourier_dim = int(getattr(cfg_policy, "force_fourier_dim", 8))
+    force_min_period = float(getattr(cfg_policy, "force_min_period", 1e-3))
+    force_max_period = float(getattr(cfg_policy, "force_max_period", 1.0))
+
+    class ForceXYZACT(ACT):
+        def __init__(self, config):
+            nn.Module.__init__(self)
+            self.config = config
+            self.force_indices = force_indices
+            self.force_encoder = FourierForceEncoder(
+                force_dim=3,
+                output_dim=config.dim_model,
+                fourier_dim=force_fourier_dim,
+                min_period=force_min_period,
+                max_period=force_max_period,
+            )
+
+            if self.config.use_vae:
+                self.vae_encoder = ACTEncoder(config, is_vae_encoder=True)
+                self.vae_encoder_cls_embed = nn.Embedding(1, config.dim_model)
+                if self.config.robot_state_feature:
+                    self.vae_encoder_robot_state_input_proj = nn.Linear(
+                        self.config.robot_state_feature.shape[0], config.dim_model
+                    )
+                self.vae_encoder_action_input_proj = nn.Linear(
+                    self.config.action_feature.shape[0],
+                    config.dim_model,
+                )
+                self.vae_encoder_latent_output_proj = nn.Linear(config.dim_model, config.latent_dim * 2)
+                num_input_token_encoder = 1 + config.chunk_size
+                if self.config.robot_state_feature:
+                    num_input_token_encoder += 1
+                self.register_buffer(
+                    "vae_encoder_pos_enc",
+                    create_sinusoidal_pos_embedding(num_input_token_encoder, config.dim_model).unsqueeze(0),
+                )
+
+            if self.config.image_features:
+                backbone_model = getattr(torchvision.models, config.vision_backbone)(
+                    replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+                    weights=config.pretrained_backbone_weights,
+                    norm_layer=FrozenBatchNorm2d,
+                )
+                self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+
+            self.encoder = ACTEncoder(config)
+            self.decoder = ACTDecoder(config)
+
+            if self.config.robot_state_feature:
+                self.encoder_robot_state_input_proj = nn.Linear(
+                    self.config.robot_state_feature.shape[0], config.dim_model
+                )
+            if self.config.env_state_feature:
+                self.encoder_env_state_input_proj = nn.Linear(
+                    self.config.env_state_feature.shape[0], config.dim_model
+                )
+            self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
+            if self.config.image_features:
+                self.encoder_img_feat_input_proj = nn.Conv2d(
+                    backbone_model.fc.in_features, config.dim_model, kernel_size=1
+                )
+
+            n_1d_tokens = 2  # latent + force token
+            if self.config.robot_state_feature:
+                n_1d_tokens += 1
+            if self.config.env_state_feature:
+                n_1d_tokens += 1
+            self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
+            if self.config.image_features:
+                self.encoder_cam_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
+
+            self.decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
+            self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
+            self._reset_parameters()
+
+        def _reset_parameters(self):
+            for p in chain(self.encoder.parameters(), self.decoder.parameters()):
+                if p.dim() > 1:
+                    nn.init.xavier_uniform_(p)
+
+        def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
+            if self.config.use_vae and self.training:
+                assert ACTION in batch, "actions must be provided when using the variational objective in training mode."
+
+            batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
+
+            if self.config.use_vae and ACTION in batch and self.training:
+                cls_embed = einops.repeat(self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size)
+                if self.config.robot_state_feature:
+                    robot_state_embed = self.vae_encoder_robot_state_input_proj(batch[OBS_STATE]).unsqueeze(1)
+                action_embed = self.vae_encoder_action_input_proj(batch[ACTION])
+
+                if self.config.robot_state_feature:
+                    vae_encoder_input = [cls_embed, robot_state_embed, action_embed]
+                else:
+                    vae_encoder_input = [cls_embed, action_embed]
+                vae_encoder_input = torch.cat(vae_encoder_input, axis=1)
+
+                pos_embed = self.vae_encoder_pos_enc.clone().detach()
+                cls_joint_is_pad = torch.full(
+                    (batch_size, 2 if self.config.robot_state_feature else 1),
+                    False,
+                    device=batch[OBS_STATE].device,
+                )
+                key_padding_mask = torch.cat([cls_joint_is_pad, batch["action_is_pad"]], axis=1)
+
+                cls_token_out = self.vae_encoder(
+                    vae_encoder_input.permute(1, 0, 2),
+                    pos_embed=pos_embed.permute(1, 0, 2),
+                    key_padding_mask=key_padding_mask,
+                )[0]
+                latent_pdf_params = self.vae_encoder_latent_output_proj(cls_token_out)
+                mu = latent_pdf_params[:, : self.config.latent_dim]
+                log_sigma_x2 = latent_pdf_params[:, self.config.latent_dim :]
+                latent_sample = mu + log_sigma_x2.div(2).exp() * torch.randn_like(mu)
+            else:
+                mu = log_sigma_x2 = None
+                latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(
+                    batch[OBS_STATE].device
+                )
+
+            encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
+            encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
+            if self.config.robot_state_feature:
+                encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
+            force_xyz = batch[OBS_STATE][:, self.force_indices]
+            encoder_in_tokens.append(self.force_encoder(force_xyz))
+            if self.config.env_state_feature:
+                encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+
+            if self.config.image_features:
+                for img in batch[OBS_IMAGES]:
+                    cam_features = self.backbone(img)["feature_map"]
+                    cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+                    cam_features = self.encoder_img_feat_input_proj(cam_features)
+                    cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
+                    cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+                    encoder_in_tokens.extend(list(cam_features))
+                    encoder_in_pos_embed.extend(list(cam_pos_embed))
+
+            encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
+            encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
+            encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
+            decoder_in = torch.zeros(
+                (self.config.chunk_size, batch_size, self.config.dim_model),
+                dtype=encoder_in_pos_embed.dtype,
+                device=encoder_in_pos_embed.device,
+            )
+            decoder_out = self.decoder(
+                decoder_in,
+                encoder_out,
+                encoder_pos_embed=encoder_in_pos_embed,
+                decoder_pos_embed=self.decoder_pos_embed.weight.unsqueeze(1),
+            )
+            actions = self.action_head(decoder_out.transpose(0, 1))
+            return actions, (mu, log_sigma_x2)
+
+    policy.model = ForceXYZACT(policy.config).to(policy.config.device)
+    policy.config.force_feature_names = resolved_names
+    policy.config.force_feature_indices = force_indices
+    policy.config.force_fourier_dim = force_fourier_dim
+    policy.config.force_min_period = force_min_period
+    policy.config.force_max_period = force_max_period
+    logging.info(
+        "Using act_force_xyz with force columns %s at observation.state indices %s",
+        resolved_names,
+        force_indices,
+    )
+    return policy
 
 
 class TimedDataset(torch.utils.data.Dataset):
@@ -128,13 +402,19 @@ class TrainPipelineConfig(HubMixin):
         self.env = None
 
         policy_type = policy["type"]
-        if policy_type == "act":
+        if policy_type in {"act", "act_force_xyz"}:
             from lerobot.policies import ACTConfig
             self.policy = ACTConfig(
                 device = policy["device"],
                 repo_id = policy["repo_id"],
                 push_to_hub = policy["push_to_hub"]
             )
+            if policy_type == "act_force_xyz":
+                self.policy.force_xyz_enabled = True
+                self.policy.force_feature_names = policy.get("force_feature_names")
+                self.policy.force_fourier_dim = policy.get("force_fourier_dim", 8)
+                self.policy.force_min_period = policy.get("force_min_period", 1e-3)
+                self.policy.force_max_period = policy.get("force_max_period", 1.0)
         elif policy_type == "diffusion":
             from lerobot.policies import DiffusionConfig
             self.policy = DiffusionConfig(
@@ -251,7 +531,9 @@ class TrainPipelineConfig(HubMixin):
                 continue
                 
             # 处理特殊类型的属性
-            if value is None:
+            if key == "policy":
+                result[key] = self._serialize_policy_config(value)
+            elif value is None:
                 result[key] = None
             elif isinstance(value, (str, int, float, bool)):
                 result[key] = value
@@ -313,6 +595,15 @@ class TrainPipelineConfig(HubMixin):
             return f"<{obj.__class__.__name__}>"
         
         return result
+
+    def _serialize_policy_config(self, policy_cfg):
+        data = self._serialize_simple_object(policy_cfg)
+        policy_type = getattr(policy_cfg, "type", None)
+        if getattr(policy_cfg, "force_xyz_enabled", False):
+            policy_type = "act_force_xyz"
+        if policy_type is not None:
+            data["type"] = policy_type
+        return data
 
     def _save_pretrained(self, save_directory: Path) -> None:
         # 使用手动实现的 to_dict 方法保存配置
@@ -526,10 +817,36 @@ def run_train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
 
     if is_main_process:
         logging.info("Creating policy")
-    policy = make_policy(
-        cfg=cfg.policy,
-        ds_meta=dataset.meta,
-    )
+    if getattr(cfg.policy, "force_xyz_enabled", False):
+        pretrained_path = cfg.policy.pretrained_path
+        cfg.policy.pretrained_path = None
+        policy = make_policy(
+            cfg=cfg.policy,
+            ds_meta=dataset.meta,
+        )
+        policy = _install_force_xyz_act(policy, dataset.meta, cfg.policy)
+        cfg.policy.pretrained_path = pretrained_path
+        if pretrained_path is not None:
+            from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
+            from safetensors.torch import load_model as load_model_as_safetensor
+
+            model_file = Path(pretrained_path) / SAFETENSORS_SINGLE_FILE
+            if not model_file.exists():
+                raise FileNotFoundError(f"Expected policy weights at {model_file}")
+            missing_keys, unexpected_keys = load_model_as_safetensor(policy, str(model_file), strict=False)
+            if is_main_process:
+                logging.info(
+                    "Loaded act_force_xyz weights from %s (missing=%s, unexpected=%s)",
+                    model_file,
+                    list(missing_keys),
+                    list(unexpected_keys),
+                )
+            policy.to(cfg.policy.device)
+    else:
+        policy = make_policy(
+            cfg=cfg.policy,
+            ds_meta=dataset.meta,
+        )
 
     print("=== 策略输入特征 (状态量) ===")
     for key, value in policy.config.input_features.items():

@@ -228,6 +228,18 @@ class FrankaInterfaceClient:
     def robot_get_ee_pose(self):
         return self._tcp_pose_to_rotvec_pose(self.robot.states().tcp_pose)
 
+    def robot_get_force_xyz(self, frame: str = "tcp"):
+        states = self.robot.states()
+        if frame == "tcp":
+            values = states.ext_wrench_in_tcp
+        elif frame == "world":
+            values = states.ext_wrench_in_world
+        elif frame == "raw":
+            values = states.ft_sensor_raw
+        else:
+            raise ValueError(f"Unsupported force frame {frame!r}; expected 'tcp', 'world', or 'raw'")
+        return np.asarray(values[:3], dtype=float)
+
     def robot_move_to_joint_positions(
         self,
         positions: np.ndarray,
