@@ -1,18 +1,18 @@
 train:
   dataset:
-    repo_id: "flexiv/teleop_0616_0617_video"
-    root: "/home/deepcybo/.cache/huggingface/lerobot/flexiv/teleop_dataset_20260616_172153_20260617_101733_video"
+    repo_id: "flexiv/teleop_dataset_20260619_104810_exclude_14_15_video"
+    root: "/home/deepcybo/.cache/huggingface/lerobot/flexiv/teleop_dataset_20260619_104810_exclude_14_15_video"
 
   env:
 
   policy:
     type: "diffusion"
     device: "cuda"
-    repo_id: "flexiv/diffusion_teleop_0616_0617"
+    repo_id: "flexiv/diffusion_teleop_20260619_104810_exclude_14_15"
     push_to_hub: false  # 禁用模型推送
 
-  output_dir: "outputs/flexiv/diffusion_teleop_0616_0617"
-  job_name: "diffusion_flexiv_teleop_0616_0617"
+  output_dir: "outputs/flexiv/diffusion_teleop_20260619_104810_exclude_14_15"
+  job_name: "diffusion_flexiv_teleop_20260619_104810_exclude_14_15"
 
   resume: false
   seed: 1000

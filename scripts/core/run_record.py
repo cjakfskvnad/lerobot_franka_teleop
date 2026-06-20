@@ -1,4 +1,9 @@
 import yaml
+import json
+import math
+import select
+import threading
+import tty
 from pathlib import Path
 from typing import Dict, Any
 from scripts.utils.dataset_utils import generate_dataset_name, update_dataset_info
@@ -31,6 +36,135 @@ from dataclasses import field
 import logging
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+
+def start_terminal_keyboard_listener(events: dict):
+    """Fallback key listener for terminals where pynput cannot capture Esc/arrows."""
+    if not sys.stdin.isatty():
+        return None
+
+    fd = sys.stdin.fileno()
+    original_attrs = termios.tcgetattr(fd)
+    stop_event = threading.Event()
+
+    def read_escape_sequence() -> str:
+        chars = ["\x1b"]
+        while select.select([sys.stdin], [], [], 0.02)[0]:
+            chars.append(sys.stdin.read(1))
+            if len(chars) >= 3:
+                break
+        return "".join(chars)
+
+    def listen():
+        tty.setcbreak(fd)
+        try:
+            while not stop_event.is_set():
+                if not select.select([sys.stdin], [], [], 0.1)[0]:
+                    continue
+
+                ch = sys.stdin.read(1)
+                if ch == "\x1b":
+                    seq = read_escape_sequence()
+                    if seq == "\x1b[C":
+                        print("Right arrow key pressed. Exiting loop...")
+                        events["exit_early"] = True
+                    elif seq == "\x1b[D":
+                        print("Left arrow key pressed. Exiting loop and rerecord the last episode...")
+                        events["rerecord_episode"] = True
+                        events["exit_early"] = True
+                    else:
+                        print("Escape key pressed. Stopping policy eval...")
+                        events["stop_recording"] = True
+                        events["exit_early"] = True
+                elif ch == "\x03":
+                    print("Ctrl+C pressed. Stopping policy eval...")
+                    events["stop_recording"] = True
+                    events["exit_early"] = True
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, original_attrs)
+
+    thread = threading.Thread(target=listen, daemon=True)
+    thread.start()
+    return stop_event, original_attrs, thread
+
+
+def stop_terminal_keyboard_listener(listener_state):
+    if listener_state is None:
+        return
+
+    stop_event, original_attrs, thread = listener_state
+    stop_event.set()
+    if thread.is_alive():
+        thread.join(timeout=0.2)
+    try:
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, original_attrs)
+    except Exception:
+        pass
+
+
+def release_gripper_then_reset(record_cfg, robot):
+    if record_cfg.use_gripper:
+        logging.info("Opening gripper before returning robot to saved home joints...")
+        robot.open_gripper(blocking=True)
+
+    if record_cfg.reset_to_home_on_stop:
+        logging.info("Returning robot to saved home joints...")
+        robot.reset(hold_grasp=False)
+
+
+def preserve_policy_eval_png_episode(dataset):
+    episode_buffer = getattr(dataset, "episode_buffer", None)
+    if not episode_buffer or episode_buffer.get("size", 0) == 0:
+        logging.info("No eval frames captured; skipping PNG preservation.")
+        return False
+
+    if getattr(dataset, "image_writer", None) is not None:
+        dataset._wait_image_writer()
+
+    episode_index = episode_buffer["episode_index"]
+    logging.info(
+        f"Preserved policy eval PNG episode {episode_index:06d} with "
+        f"{episode_buffer['size']} frames under {dataset.root / 'images'}"
+    )
+    dataset.episode_buffer = dataset.create_episode_buffer(episode_index + 1)
+    return True
+
+
+def prompt_restart_policy_eval(record_cfg, robot, events, terminal_keyboard_listener):
+    stop_terminal_keyboard_listener(terminal_keyboard_listener)
+
+    release_gripper_then_reset(record_cfg, robot)
+
+    try:
+        termios.tcflush(sys.stdin, termios.TCIFLUSH)
+    except Exception:
+        pass
+
+    user_input = input("====== [PAUSED] Press n then Enter to run eval again, anything else to exit ======").strip().lower()
+    if user_input == "n":
+        events["stop_recording"] = False
+        events["exit_early"] = False
+        events["rerecord_episode"] = False
+        return True, start_terminal_keyboard_listener(events)
+
+    return False, None
+
+
+def load_saved_home_joints_rad(path: str | Path) -> list[float]:
+    pose_path = Path(path).expanduser()
+    data = json.loads(pose_path.read_text(encoding="utf-8"))
+
+    if "q_rad" in data:
+        joints = [float(v) for v in data["q_rad"]]
+    elif "q_deg" in data:
+        joints = [math.radians(float(v)) for v in data["q_deg"]]
+    else:
+        raise ValueError(f"{pose_path} must contain q_rad or q_deg")
+
+    if len(joints) != 7:
+        raise ValueError(f"Expected 7 saved joints in {pose_path}, got {len(joints)}")
+
+    return joints
 
 
 class RecordConfig:
@@ -69,6 +203,14 @@ class RecordConfig:
         self.gripper_init_wait_sec: float = robot.get("gripper_init_wait_sec", 5.0)
         self.home_plan: str = robot.get("home_plan", "PLAN-Home")
         self.home_joints: list[float] | None = robot.get("home_joints")
+        self.saved_joint_pose_file: str = robot.get(
+            "saved_joint_pose_file",
+            str(Path(__file__).resolve().parents[3] / "example_py" / "saved_joint_pose.json"),
+        )
+        self.reset_to_home_on_stop: bool = robot.get("reset_to_home_on_stop", True)
+        if not self.home_joints:
+            self.home_joints = load_saved_home_joints_rad(self.saved_joint_pose_file)
+            logging.info(f"Loaded home_joints from {self.saved_joint_pose_file}")
         self.command_frequency: int = robot.get("command_frequency", 50)
         self.use_gripper: bool = robot["use_gripper"]
         self.close_threshold = robot["close_threshold"]
@@ -151,6 +293,20 @@ class RecordConfig:
     def _parse_policy_config(self, policy: Dict[str, Any]) -> None:
         """Parse policy configuration."""
         policy_type = policy["type"]
+        pretrained_path = policy.get("pretrained_path")
+
+        if pretrained_path:
+            self.policy = PreTrainedConfig.from_pretrained(pretrained_path)
+            if self.policy.type != policy_type:
+                raise ValueError(
+                    f"Configured policy type {policy_type!r} does not match pretrained policy "
+                    f"type {self.policy.type!r} in {pretrained_path}"
+                )
+            self.policy.device = policy["device"]
+            self.policy.push_to_hub = policy["push_to_hub"]
+            self.policy.pretrained_path = pretrained_path
+            return
+
         if policy_type == "act":
             from lerobot.policies import ACTConfig
             self.policy = ACTConfig(
@@ -165,9 +321,6 @@ class RecordConfig:
             )
         else:
             raise ValueError(f"No config for policy type: {policy_type}")
-        
-        if policy.get("pretrained_path"):
-            self.policy.pretrained_path = policy["pretrained_path"]
     
     def create_teleop_config(self):
         """Create teleoperation configuration object."""
@@ -340,6 +493,7 @@ def run_record(record_cfg: RecordConfig):
 
         # Initialize the keyboard listener and rerun visualization
         _, events = init_keyboard_listener()
+        terminal_keyboard_listener = start_terminal_keyboard_listener(events)
         if record_cfg.display:
             init_rerun(session_name="recording")
 
@@ -378,8 +532,10 @@ def run_record(record_cfg: RecordConfig):
             teleop.connect()
 
         episode_idx = 0
+        robot_returned_home = False
 
-        while episode_idx < record_cfg.num_episodes and not events["stop_recording"]:
+        should_exit = False
+        while episode_idx < record_cfg.num_episodes and not should_exit:
             logging.info(f"====== [RECORD] Recording episode {episode_idx + 1} of {record_cfg.num_episodes} ======")
             record_loop(
                 robot=robot,
@@ -398,6 +554,18 @@ def run_record(record_cfg: RecordConfig):
                 display_data=record_cfg.display,
             )
 
+            if events["stop_recording"] and record_cfg.run_mode == "run_policy":
+                preserve_policy_eval_png_episode(dataset)
+                restart, terminal_keyboard_listener = prompt_restart_policy_eval(
+                    record_cfg, robot, events, terminal_keyboard_listener
+                )
+                robot_returned_home = True
+                if restart:
+                    robot_returned_home = False
+                    continue
+                should_exit = True
+                break
+
             if events["rerecord_episode"]:
                 logging.info("Re-recording episode")
                 events["rerecord_episode"] = False
@@ -405,7 +573,10 @@ def run_record(record_cfg: RecordConfig):
                 dataset.clear_episode_buffer()
                 continue
 
-            dataset.save_episode()
+            if record_cfg.run_mode == "run_policy":
+                preserve_policy_eval_png_episode(dataset)
+            else:
+                dataset.save_episode()
 
             # Reset the environment if not stopping or re-recording
             if not events["stop_recording"] and (episode_idx < record_cfg.num_episodes - 1 or events["rerecord_episode"]):
@@ -418,24 +589,20 @@ def run_record(record_cfg: RecordConfig):
                         logging.info("====== [WARNING] Please press only Enter to continue ======")
 
                 logging.info("====== [RESET] Resetting the environment ======")
-                record_loop(
-                    robot=robot,
-                    events=events,
-                    fps=record_cfg.fps,
-                    teleop=teleop,
-                    teleop_action_processor=teleop_action_processor,
-                    robot_action_processor=robot_action_processor,
-                    robot_observation_processor=robot_observation_processor,
-                    control_time_s=record_cfg.reset_time_sec,
-                    single_task=record_cfg.task_description,
-                    display_data=record_cfg.display,
-                )
+                robot.reset()
 
             episode_idx += 1
 
         # Clean up
         logging.info("Stop recording")
+        if record_cfg.reset_to_home_on_stop and not robot_returned_home:
+            try:
+                logging.info("Returning robot to saved home joints before exit...")
+                robot.reset()
+            except Exception as e:
+                logging.warning(f"Failed to return robot to saved home joints: {e}")
         robot.disconnect()
+        stop_terminal_keyboard_listener(terminal_keyboard_listener)
         if teleop is not None:
             teleop.disconnect()
         dataset.finalize()
@@ -445,13 +612,22 @@ def run_record(record_cfg: RecordConfig):
             dataset.push_to_hub()
 
     except Exception as e:
+        stop_terminal_keyboard_listener(locals().get("terminal_keyboard_listener"))
         logging.info(f"====== [ERROR] {e} ======")
         dataset_path = Path(HF_LEROBOT_HOME) / dataset_name
         handle_incomplete_dataset(dataset_path)
         sys.exit(1)
 
     except KeyboardInterrupt:
+        stop_terminal_keyboard_listener(locals().get("terminal_keyboard_listener"))
         logging.info("\n====== [INFO] Ctrl+C detected, cleaning up incomplete dataset... ======")
+        try:
+            if "robot" in locals() and robot.is_connected and record_cfg.reset_to_home_on_stop:
+                logging.info("Returning robot to saved home joints before exit...")
+                robot.reset()
+                robot.disconnect()
+        except Exception as e:
+            logging.warning(f"Failed to return robot to saved home joints: {e}")
         dataset_path = Path(HF_LEROBOT_HOME) / dataset_name
         handle_incomplete_dataset(dataset_path)
         sys.exit(1)

@@ -34,6 +34,11 @@ TDK_POSE_JOINT_NAMES = [
     "follower_q_6",
 ]
 
+TDK_GRIPPER_NAMES = [
+    "follower_gripper_command",
+    "follower_gripper_width",
+]
+
 
 class Franka(Robot):
     config_class = FrankaConfig
@@ -171,7 +176,24 @@ class Franka(Robot):
         return franka
 
 
-    def reset(self) -> None:
+    def open_gripper(self, blocking: bool = True) -> None:
+        """Open the Flexiv gripper, bypassing grasp-hold mode when needed."""
+        if not self.config.use_gripper or self._robot is None:
+            return
+
+        try:
+            self._robot.gripper_goto(
+                width=self.config.gripper_max_open,
+                speed=self._gripper_speed,
+                force=self._gripper_force,
+                blocking=blocking,
+            )
+            self._last_gripper_position = 1.0
+            self._gripper_position = 1.0
+        except Exception as e:
+            logger.warning(f"[GRIPPER] Failed to open Flexiv gripper: {e}")
+
+    def reset(self, hold_grasp: bool | None = None) -> None:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self.name} is not connected.")
 
@@ -195,15 +217,13 @@ class Franka(Robot):
         else:
             print(f"\nExecuting home plan: {self.config.home_plan} ...\n")
             self._robot.robot_go_home()
-        if self._gripper_always_grasp:
+        if hold_grasp is None:
+            hold_grasp = self._gripper_always_grasp
+
+        if hold_grasp:
             self._apply_gripper_grasp_hold()
         else:
-            self._robot.gripper_goto(
-                width=self.config.gripper_max_open,
-                speed=self._gripper_speed,
-                force=self._gripper_force,
-                blocking=True
-            )
+            self.open_gripper(blocking=True)
         # self._robot.gripper_goto(width=self.config.gripper_max_open, speed=self._gripper_speed, force=self._gripper_force, blocking=True)
         logger.info("===== [ROBOT] Robot reset successfully =====\n")
 
@@ -226,7 +246,10 @@ class Franka(Robot):
     @property
     def _motors_ft(self) -> dict[str, type]:
         if self.config.policy_io_schema == "tdk_pose_joint":
-            return {name: float for name in TDK_POSE_JOINT_NAMES}
+            names = [*TDK_POSE_JOINT_NAMES]
+            if self.config.use_gripper:
+                names.extend(TDK_GRIPPER_NAMES)
+            return {name: float for name in names}
 
         return {
             # joint positions
@@ -270,7 +293,10 @@ class Franka(Robot):
     def action_features(self) -> dict[str, type]:
         """Return action features based on control mode."""
         if self.config.policy_io_schema == "tdk_pose_joint":
-            return {name: float for name in TDK_POSE_JOINT_NAMES}
+            names = [*TDK_POSE_JOINT_NAMES]
+            if self.config.use_gripper:
+                names.extend(TDK_GRIPPER_NAMES)
+            return {name: float for name in names}
 
         if self.config.control_mode == "isoteleop":
             features = {}
@@ -327,6 +353,60 @@ class Franka(Robot):
             self._gripper_position = gripper_state_norm
         except Exception as e:
             logger.warning(f"[GRIPPER] Flexiv gripper error: {e}")
+
+    def _handle_tdk_gripper(self, action: dict[str, Any]) -> None:
+        """Handle gripper fields from Flexiv TDK datasets.
+
+        TDK recording stores command=0 for open and command=1 for clamp. Width is
+        kept as a fallback for datasets that only carry measured gripper width.
+        """
+        if not self.config.use_gripper:
+            return
+
+        if "follower_gripper_command" in action:
+            # TDK command: 0=open, 1=clamp. Internal normalized position: 1=open, 0=closed.
+            command = 1.0 if float(action["follower_gripper_command"]) >= 0.5 else 0.0
+            if self.config.gripper_reverse:
+                command = 1.0 - command
+            target_open_norm = 1.0 - command
+            try:
+                if command >= 0.5 and self._gripper_always_grasp:
+                    self._apply_gripper_grasp_hold()
+                    return
+
+                if target_open_norm != self._last_gripper_position:
+                    self._robot.gripper_goto(
+                        width=target_open_norm * self.config.gripper_max_open,
+                        speed=self._gripper_speed,
+                        force=self._gripper_force,
+                        blocking=False,
+                    )
+                    self._last_gripper_position = target_open_norm
+            except Exception as e:
+                logger.warning(f"[GRIPPER] Flexiv TDK gripper command failed: {e}")
+            return
+
+        if "follower_gripper_width" not in action:
+            return
+
+        if self._gripper_always_grasp:
+            width = float(action["follower_gripper_width"])
+            if width <= self.config.close_threshold * self.config.gripper_max_open:
+                self._apply_gripper_grasp_hold()
+            return
+
+        try:
+            width = max(0.0, min(self.config.gripper_max_open, float(action["follower_gripper_width"])))
+            if abs(width - self._last_gripper_position * self.config.gripper_max_open) > 1e-3:
+                self._robot.gripper_goto(
+                    width=width,
+                    speed=self._gripper_speed,
+                    force=self._gripper_force,
+                    blocking=False,
+                )
+                self._last_gripper_position = width / self.config.gripper_max_open
+        except Exception as e:
+            logger.warning(f"[GRIPPER] Flexiv TDK gripper width command failed: {e}")
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         if not self.is_connected:
@@ -530,6 +610,7 @@ class Franka(Robot):
                     self._robot.robot_update_desired_ee_pose(target_ee_pose)
                 except Exception as e:
                     logger.warning(f"[ROBOT] TDK Cartesian action failed: {e}")
+            self._handle_tdk_gripper(action)
             return
 
         target_joints = np.array([action[f"follower_q_{i}"] for i in range(self._num_joints)])
@@ -549,6 +630,7 @@ class Franka(Robot):
                     self._robot.robot_update_desired_joint_positions(target_joints)
             except Exception as e:
                 logger.warning(f"[ROBOT] TDK joint action failed: {e}")
+        self._handle_tdk_gripper(action)
 
     def _send_action_oculus_joint(self, action: dict[str, Any]) -> None:
         """Send action in oculus mode using joint positions from Placo IK.
@@ -651,6 +733,16 @@ class Franka(Robot):
             }
             for i in range(len(joint_position)):
                 obs_dict[f"follower_q_{i}"] = float(joint_position[i])
+
+            if self.config.use_gripper:
+                try:
+                    gripper_state = self._robot.gripper_get_state()
+                    width = float(gripper_state["width"])
+                except Exception as e:
+                    logger.warning(f"[GRIPPER] Failed to read Flexiv gripper state: {e}")
+                    width = self._gripper_position * self.config.gripper_max_open
+                obs_dict["follower_gripper_width"] = width
+                obs_dict["follower_gripper_command"] = float(1.0 - self._last_gripper_position)
 
             for cam_key, cam in self.cameras.items():
                 start = time.perf_counter()
