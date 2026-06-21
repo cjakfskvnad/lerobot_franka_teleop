@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, Any
 import yaml
 
+import numpy as np
 import torch
 from torch import Tensor, nn
 from accelerate import Accelerator
@@ -70,6 +71,8 @@ from lerobot.optim.schedulers import LRSchedulerConfig
 from lerobot.utils.hub import HubMixin
 
 TRAIN_CONFIG_NAME = "train_config.json"
+FORCE_HISTORY_KEY = "observation.force_history"
+DEFAULT_FORCE_SIDECAR_FILENAME = "force_sidecar.npz"
 DEFAULT_FORCE_XYZ_NAMES = (
     ("follower_ext_wrench_tcp_fx", "follower_ext_wrench_tcp_fy", "follower_ext_wrench_tcp_fz"),
     ("follower_ext_wrench_world_fx", "follower_ext_wrench_world_fy", "follower_ext_wrench_world_fz"),
@@ -80,6 +83,134 @@ DEFAULT_FORCE_XYZ_NAMES = (
     ("force_x", "force_y", "force_z"),
     ("fx", "fy", "fz"),
 )
+
+
+class ForceSidecarDataset(torch.utils.data.Dataset):
+    """Add fixed-length force windows from a sidecar npz without expanding parquet rows."""
+
+    def __init__(
+        self,
+        dataset,
+        sidecar_path: str | Path | None = None,
+        history_samples: int | None = None,
+        normalize: bool = True,
+    ):
+        self.dataset = dataset
+        self.sidecar_path = Path(sidecar_path) if sidecar_path else Path(dataset.root) / DEFAULT_FORCE_SIDECAR_FILENAME
+        if not self.sidecar_path.exists():
+            raise FileNotFoundError(f"Force sidecar not found: {self.sidecar_path}")
+
+        self.sidecar = np.load(self.sidecar_path, mmap_mode="r", allow_pickle=False)
+        self.force_values = self.sidecar["force_values"]
+        self.frame_to_force_index = self.sidecar["frame_to_force_index"].astype(np.int64)
+        self.episode_starts = self.sidecar["episode_starts"].astype(np.int64)
+        self.episode_ends = self.sidecar["episode_ends"].astype(np.int64)
+        metadata = json.loads(str(self.sidecar["metadata_json"])) if "metadata_json" in self.sidecar else {}
+        self.history_samples = int(history_samples or metadata.get("history_samples", 200))
+        if self.history_samples <= 0:
+            raise ValueError(f"force_history_samples must be positive, got {self.history_samples}")
+        if len(self.frame_to_force_index) != len(dataset):
+            raise ValueError(
+                f"Force sidecar frame_to_force_index length {len(self.frame_to_force_index)} "
+                f"does not match dataset length {len(dataset)}"
+            )
+        if normalize:
+            values = np.asarray(self.force_values, dtype=np.float32)
+            self.force_mean = values.mean(axis=0).astype(np.float32)
+            self.force_std = values.std(axis=0).astype(np.float32)
+            self.force_std = np.maximum(self.force_std, np.asarray(1e-6, dtype=np.float32))
+        else:
+            self.force_mean = np.zeros(self.force_values.shape[1], dtype=np.float32)
+            self.force_std = np.ones(self.force_values.shape[1], dtype=np.float32)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getattr__(self, name):
+        return getattr(self.dataset, name)
+
+    def _episode_bounds(self, episode_index: int) -> tuple[int, int]:
+        return int(self.episode_starts[episode_index]), int(self.episode_ends[episode_index])
+
+    def _window_for_dataset_index(self, dataset_index: int, episode_index: int) -> np.ndarray:
+        ep_start, ep_end = self._episode_bounds(episode_index)
+        center = int(self.frame_to_force_index[dataset_index])
+        center = min(max(center, ep_start), ep_end - 1)
+        indices = np.arange(center - self.history_samples + 1, center + 1, dtype=np.int64)
+        indices = np.clip(indices, ep_start, ep_end - 1)
+        window = np.asarray(self.force_values[indices], dtype=np.float32)
+        return (window - self.force_mean) / self.force_std
+
+    def _observation_indices(self, index: int, episode_index: int) -> list[int]:
+        delta_indices = getattr(self.dataset, "delta_indices", None)
+        state_delta = delta_indices.get("observation.state") if delta_indices else None
+        if state_delta is None:
+            return [index]
+        ep = self.dataset.meta.episodes[episode_index]
+        ep_start = int(ep["dataset_from_index"])
+        ep_end = int(ep["dataset_to_index"])
+        return [max(ep_start, min(ep_end - 1, index + int(delta))) for delta in state_delta]
+
+    def __getitem__(self, index):
+        item = self.dataset[index]
+        episode_index = int(item["episode_index"].item() if hasattr(item["episode_index"], "item") else item["episode_index"])
+        obs_indices = self._observation_indices(int(index), episode_index)
+        windows = [self._window_for_dataset_index(obs_idx, episode_index) for obs_idx in obs_indices]
+        force_history = np.stack(windows, axis=0) if len(windows) > 1 else windows[0]
+        item[FORCE_HISTORY_KEY] = torch.from_numpy(force_history.astype(np.float32, copy=False))
+        return item
+
+
+class ForceHistoryTransformerEncoder(nn.Module):
+    """Encode a causal force window as one readout token, following the FoAR force branch pattern."""
+
+    def __init__(
+        self,
+        force_dim: int,
+        output_dim: int,
+        history_samples: int,
+        num_layers: int = 2,
+        nhead: int = 4,
+        dim_feedforward: int | None = None,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        if output_dim % nhead != 0:
+            raise ValueError(f"force_history_dim {output_dim} must be divisible by force_history_nhead {nhead}")
+        self.force_dim = force_dim
+        self.output_dim = output_dim
+        self.history_samples = history_samples
+        self.input_proj = nn.Linear(force_dim, output_dim)
+        self.readout_embed = nn.Parameter(torch.zeros(1, 1, output_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, history_samples + 1, output_dim))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=output_dim,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward or output_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(output_dim)
+        nn.init.trunc_normal_(self.readout_embed, std=0.02)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+    def forward(self, force_history: Tensor) -> Tensor:
+        if force_history.dim() != 3 or force_history.shape[-1] != self.force_dim:
+            raise ValueError(
+                f"Expected force history shape (B, T, {self.force_dim}), got {tuple(force_history.shape)}"
+            )
+        if force_history.shape[1] != self.history_samples:
+            raise ValueError(
+                f"Expected {self.history_samples} force samples, got {force_history.shape[1]}"
+            )
+        force_history = force_history.to(dtype=torch.float32)
+        tokens = self.input_proj(force_history)
+        readout = self.readout_embed.expand(tokens.shape[0], -1, -1)
+        tokens = torch.cat([readout, tokens], dim=1) + self.pos_embed
+        return self.norm(self.transformer(tokens)[:, 0])
 
 
 class FourierForceEncoder(nn.Module):
@@ -344,6 +475,323 @@ def _install_force_xyz_act(policy: PreTrainedPolicy, ds_meta, cfg_policy) -> Pre
     return policy
 
 
+def _force_history_config(cfg_policy) -> dict[str, Any]:
+    return {
+        "history_samples": int(getattr(cfg_policy, "force_history_samples", 200)),
+        "force_dim": int(getattr(cfg_policy, "force_history_input_dim", 3)),
+        "output_dim": int(getattr(cfg_policy, "force_history_dim", getattr(cfg_policy, "dim_model", 512))),
+        "num_layers": int(getattr(cfg_policy, "force_history_layers", 2)),
+        "nhead": int(getattr(cfg_policy, "force_history_nhead", 4)),
+        "dropout": float(getattr(cfg_policy, "force_history_dropout", 0.1)),
+    }
+
+
+def _install_force_history_act(policy: PreTrainedPolicy, cfg_policy) -> PreTrainedPolicy:
+    from itertools import chain
+
+    import einops
+    import torchvision
+    from torchvision.models._utils import IntermediateLayerGetter
+    from torchvision.ops.misc import FrozenBatchNorm2d
+
+    from lerobot.policies.act.modeling_act import (
+        ACT,
+        ACTEncoder,
+        ACTDecoder,
+        ACTSinusoidalPositionEmbedding2d,
+        create_sinusoidal_pos_embedding,
+    )
+    from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+
+    force_cfg = _force_history_config(cfg_policy)
+    force_cfg["output_dim"] = policy.config.dim_model
+
+    class ForceHistoryACT(ACT):
+        def __init__(self, config):
+            nn.Module.__init__(self)
+            self.config = config
+            self.force_history_encoder = ForceHistoryTransformerEncoder(**force_cfg)
+
+            if self.config.use_vae:
+                self.vae_encoder = ACTEncoder(config, is_vae_encoder=True)
+                self.vae_encoder_cls_embed = nn.Embedding(1, config.dim_model)
+                if self.config.robot_state_feature:
+                    self.vae_encoder_robot_state_input_proj = nn.Linear(
+                        self.config.robot_state_feature.shape[0], config.dim_model
+                    )
+                self.vae_encoder_action_input_proj = nn.Linear(
+                    self.config.action_feature.shape[0],
+                    config.dim_model,
+                )
+                self.vae_encoder_latent_output_proj = nn.Linear(config.dim_model, config.latent_dim * 2)
+                num_input_token_encoder = 1 + config.chunk_size
+                if self.config.robot_state_feature:
+                    num_input_token_encoder += 1
+                self.register_buffer(
+                    "vae_encoder_pos_enc",
+                    create_sinusoidal_pos_embedding(num_input_token_encoder, config.dim_model).unsqueeze(0),
+                )
+
+            if self.config.image_features:
+                backbone_model = getattr(torchvision.models, config.vision_backbone)(
+                    replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+                    weights=config.pretrained_backbone_weights,
+                    norm_layer=FrozenBatchNorm2d,
+                )
+                self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+
+            self.encoder = ACTEncoder(config)
+            self.decoder = ACTDecoder(config)
+
+            if self.config.robot_state_feature:
+                self.encoder_robot_state_input_proj = nn.Linear(
+                    self.config.robot_state_feature.shape[0], config.dim_model
+                )
+            if self.config.env_state_feature:
+                self.encoder_env_state_input_proj = nn.Linear(
+                    self.config.env_state_feature.shape[0], config.dim_model
+                )
+            self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
+            if self.config.image_features:
+                self.encoder_img_feat_input_proj = nn.Conv2d(
+                    backbone_model.fc.in_features, config.dim_model, kernel_size=1
+                )
+
+            n_1d_tokens = 2  # latent + force-history readout
+            if self.config.robot_state_feature:
+                n_1d_tokens += 1
+            if self.config.env_state_feature:
+                n_1d_tokens += 1
+            self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
+            if self.config.image_features:
+                self.encoder_cam_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
+
+            self.decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
+            self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
+            self._reset_parameters()
+
+        def _reset_parameters(self):
+            for p in chain(self.encoder.parameters(), self.decoder.parameters()):
+                if p.dim() > 1:
+                    nn.init.xavier_uniform_(p)
+
+        def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
+            if self.config.use_vae and self.training:
+                assert ACTION in batch, "actions must be provided when using the variational objective in training mode."
+            if FORCE_HISTORY_KEY not in batch:
+                raise KeyError(f"{FORCE_HISTORY_KEY!r} is required for act_force_history.")
+
+            batch_size = batch[OBS_STATE].shape[0]
+
+            if self.config.use_vae and ACTION in batch and self.training:
+                cls_embed = einops.repeat(self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size)
+                if self.config.robot_state_feature:
+                    robot_state_embed = self.vae_encoder_robot_state_input_proj(batch[OBS_STATE]).unsqueeze(1)
+                action_embed = self.vae_encoder_action_input_proj(batch[ACTION])
+
+                if self.config.robot_state_feature:
+                    vae_encoder_input = [cls_embed, robot_state_embed, action_embed]
+                else:
+                    vae_encoder_input = [cls_embed, action_embed]
+                vae_encoder_input = torch.cat(vae_encoder_input, axis=1)
+
+                pos_embed = self.vae_encoder_pos_enc.clone().detach()
+                cls_joint_is_pad = torch.full(
+                    (batch_size, 2 if self.config.robot_state_feature else 1),
+                    False,
+                    device=batch[OBS_STATE].device,
+                )
+                key_padding_mask = torch.cat([cls_joint_is_pad, batch["action_is_pad"]], axis=1)
+
+                cls_token_out = self.vae_encoder(
+                    vae_encoder_input.permute(1, 0, 2),
+                    pos_embed=pos_embed.permute(1, 0, 2),
+                    key_padding_mask=key_padding_mask,
+                )[0]
+                latent_pdf_params = self.vae_encoder_latent_output_proj(cls_token_out)
+                mu = latent_pdf_params[:, : self.config.latent_dim]
+                log_sigma_x2 = latent_pdf_params[:, self.config.latent_dim :]
+                latent_sample = mu + log_sigma_x2.div(2).exp() * torch.randn_like(mu)
+            else:
+                mu = log_sigma_x2 = None
+                latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(
+                    batch[OBS_STATE].device
+                )
+
+            encoder_in_tokens = [self.encoder_latent_input_proj(latent_sample)]
+            encoder_in_pos_embed = list(self.encoder_1d_feature_pos_embed.weight.unsqueeze(1))
+            if self.config.robot_state_feature:
+                encoder_in_tokens.append(self.encoder_robot_state_input_proj(batch[OBS_STATE]))
+            encoder_in_tokens.append(self.force_history_encoder(batch[FORCE_HISTORY_KEY]))
+            if self.config.env_state_feature:
+                encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
+
+            if self.config.image_features:
+                for img in batch[OBS_IMAGES]:
+                    cam_features = self.backbone(img)["feature_map"]
+                    cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+                    cam_features = self.encoder_img_feat_input_proj(cam_features)
+                    cam_features = einops.rearrange(cam_features, "b c h w -> (h w) b c")
+                    cam_pos_embed = einops.rearrange(cam_pos_embed, "b c h w -> (h w) b c")
+                    encoder_in_tokens.extend(list(cam_features))
+                    encoder_in_pos_embed.extend(list(cam_pos_embed))
+
+            encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)
+            encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
+            encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed)
+            decoder_in = torch.zeros(
+                (self.config.chunk_size, batch_size, self.config.dim_model),
+                dtype=encoder_in_pos_embed.dtype,
+                device=encoder_in_pos_embed.device,
+            )
+            decoder_out = self.decoder(
+                decoder_in,
+                encoder_out,
+                encoder_pos_embed=encoder_in_pos_embed,
+                decoder_pos_embed=self.decoder_pos_embed.weight.unsqueeze(1),
+            )
+            actions = self.action_head(decoder_out.transpose(0, 1))
+            return actions, (mu, log_sigma_x2)
+
+    policy.model = ForceHistoryACT(policy.config).to(policy.config.device)
+    policy.config.force_history_enabled = True
+    policy.config.force_history_samples = force_cfg["history_samples"]
+    policy.config.force_history_input_dim = force_cfg["force_dim"]
+    policy.config.force_history_dim = force_cfg["output_dim"]
+    logging.info("Using act_force_history with %s samples", force_cfg["history_samples"])
+    return policy
+
+
+def _install_force_history_diffusion(policy: PreTrainedPolicy, cfg_policy) -> PreTrainedPolicy:
+    import einops
+
+    from lerobot.policies.diffusion.modeling_diffusion import (
+        DiffusionConditionalUnet1d,
+        DiffusionModel,
+        DiffusionRgbEncoder,
+        _make_noise_scheduler,
+    )
+    from lerobot.utils.constants import OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+
+    force_cfg = _force_history_config(cfg_policy)
+
+    class ForceHistoryDiffusionModel(DiffusionModel):
+        def __init__(self, config):
+            nn.Module.__init__(self)
+            self.config = config
+            self.force_history_encoder = ForceHistoryTransformerEncoder(**force_cfg)
+
+            global_cond_dim = self.config.robot_state_feature.shape[0] + force_cfg["output_dim"]
+            if self.config.image_features:
+                num_images = len(self.config.image_features)
+                if self.config.use_separate_rgb_encoder_per_camera:
+                    encoders = [DiffusionRgbEncoder(config) for _ in range(num_images)]
+                    self.rgb_encoder = nn.ModuleList(encoders)
+                    global_cond_dim += encoders[0].feature_dim * num_images
+                else:
+                    self.rgb_encoder = DiffusionRgbEncoder(config)
+                    global_cond_dim += self.rgb_encoder.feature_dim * num_images
+            if self.config.env_state_feature:
+                global_cond_dim += self.config.env_state_feature.shape[0]
+
+            self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
+            self.noise_scheduler = _make_noise_scheduler(
+                config.noise_scheduler_type,
+                num_train_timesteps=config.num_train_timesteps,
+                beta_start=config.beta_start,
+                beta_end=config.beta_end,
+                beta_schedule=config.beta_schedule,
+                clip_sample=config.clip_sample,
+                clip_sample_range=config.clip_sample_range,
+                prediction_type=config.prediction_type,
+            )
+            self.num_inference_steps = (
+                self.noise_scheduler.config.num_train_timesteps
+                if config.num_inference_steps is None
+                else config.num_inference_steps
+            )
+
+        def _encode_force_history(self, force_history: Tensor, batch_size: int, n_obs_steps: int) -> Tensor:
+            if force_history.dim() == 3:
+                force_history = force_history.unsqueeze(1)
+            if force_history.dim() != 4:
+                raise ValueError(
+                    f"Expected {FORCE_HISTORY_KEY} shape (B, S, T, C), got {tuple(force_history.shape)}"
+                )
+            if force_history.shape[:2] != (batch_size, n_obs_steps):
+                raise ValueError(
+                    f"Expected {FORCE_HISTORY_KEY} leading dims {(batch_size, n_obs_steps)}, "
+                    f"got {tuple(force_history.shape[:2])}"
+                )
+            encoded = self.force_history_encoder(
+                einops.rearrange(force_history, "b s t c -> (b s) t c")
+            )
+            return einops.rearrange(encoded, "(b s) d -> b s d", b=batch_size, s=n_obs_steps)
+
+        def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
+            if FORCE_HISTORY_KEY not in batch:
+                raise KeyError(f"{FORCE_HISTORY_KEY!r} is required for diffusion_force_history.")
+            batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
+            global_cond_feats = [batch[OBS_STATE]]
+
+            if self.config.image_features:
+                if self.config.use_separate_rgb_encoder_per_camera:
+                    images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
+                    img_features_list = torch.cat(
+                        [
+                            encoder(images)
+                            for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
+                        ]
+                    )
+                    img_features = einops.rearrange(
+                        img_features_list, "(n b s) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+                    )
+                else:
+                    img_features = self.rgb_encoder(
+                        einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
+                    )
+                    img_features = einops.rearrange(
+                        img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+                    )
+                global_cond_feats.append(img_features)
+
+            global_cond_feats.append(self._encode_force_history(batch[FORCE_HISTORY_KEY], batch_size, n_obs_steps))
+
+            if self.config.env_state_feature:
+                global_cond_feats.append(batch[OBS_ENV_STATE])
+
+            return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
+
+    policy.diffusion = ForceHistoryDiffusionModel(policy.config).to(policy.config.device)
+    policy.config.force_history_enabled = True
+    policy.config.force_history_samples = force_cfg["history_samples"]
+    policy.config.force_history_input_dim = force_cfg["force_dim"]
+    policy.config.force_history_dim = force_cfg["output_dim"]
+    logging.info(
+        "Using diffusion_force_history with %s samples and readout dim %s",
+        force_cfg["history_samples"],
+        force_cfg["output_dim"],
+    )
+    return policy
+
+
+def _maybe_wrap_force_sidecar_dataset(dataset, cfg_policy):
+    if not getattr(cfg_policy, "force_history_enabled", False):
+        return dataset
+    wrapped = ForceSidecarDataset(
+        dataset,
+        sidecar_path=getattr(cfg_policy, "force_sidecar_path", None),
+        history_samples=int(getattr(cfg_policy, "force_history_samples", 200)),
+        normalize=bool(getattr(cfg_policy, "force_history_normalize", True)),
+    )
+    logging.info(
+        "Using force sidecar %s with %s samples per observation",
+        wrapped.sidecar_path,
+        wrapped.history_samples,
+    )
+    return wrapped
+
+
 class TimedDataset(torch.utils.data.Dataset):
     """Dataset wrapper that accumulates __getitem__ timing in the main process."""
 
@@ -402,7 +850,7 @@ class TrainPipelineConfig(HubMixin):
         self.env = None
 
         policy_type = policy["type"]
-        if policy_type in {"act", "act_force_xyz"}:
+        if policy_type in {"act", "act_force_xyz", "act_force_history"}:
             from lerobot.policies import ACTConfig
             self.policy = ACTConfig(
                 device = policy["device"],
@@ -415,15 +863,40 @@ class TrainPipelineConfig(HubMixin):
                 self.policy.force_fourier_dim = policy.get("force_fourier_dim", 8)
                 self.policy.force_min_period = policy.get("force_min_period", 1e-3)
                 self.policy.force_max_period = policy.get("force_max_period", 1.0)
-        elif policy_type == "diffusion":
+            if policy_type == "act_force_history":
+                self.policy.force_history_enabled = True
+        elif policy_type in {"diffusion", "diffusion_force_history"}:
             from lerobot.policies import DiffusionConfig
             self.policy = DiffusionConfig(
                 device = policy["device"],
                 repo_id = policy["repo_id"],
                 push_to_hub = policy["push_to_hub"]
             )
+            if policy_type == "diffusion_force_history":
+                self.policy.force_history_enabled = True
         else:
             raise ValueError(f"no config for policy type: {policy_type}")
+
+        force_sidecar_path = policy.get("force_sidecar_path")
+        if force_sidecar_path is None:
+            default_force_sidecar_path = Path(dataset["root"]) / DEFAULT_FORCE_SIDECAR_FILENAME
+            force_sidecar_path = str(default_force_sidecar_path) if default_force_sidecar_path.exists() else None
+        auto_force_history = force_sidecar_path is not None and policy_type in {
+            "act",
+            "act_force_history",
+            "diffusion",
+            "diffusion_force_history",
+        }
+        if policy.get("force_history_enabled", auto_force_history):
+            self.policy.force_history_enabled = True
+        self.policy.force_sidecar_path = force_sidecar_path
+        self.policy.force_history_samples = policy.get("force_history_samples", 200)
+        self.policy.force_history_input_dim = policy.get("force_history_input_dim", 3)
+        self.policy.force_history_dim = policy.get("force_history_dim", 256)
+        self.policy.force_history_layers = policy.get("force_history_layers", 2)
+        self.policy.force_history_nhead = policy.get("force_history_nhead", 4)
+        self.policy.force_history_dropout = policy.get("force_history_dropout", 0.1)
+        self.policy.force_history_normalize = policy.get("force_history_normalize", True)
 
         # Set `dir` to where you would like to save all of the run outputs. If you run another training session
         # with the same value for `dir` its contents will be overwritten unless you set `resume` to true.
@@ -599,7 +1072,11 @@ class TrainPipelineConfig(HubMixin):
     def _serialize_policy_config(self, policy_cfg):
         data = self._serialize_simple_object(policy_cfg)
         policy_type = getattr(policy_cfg, "type", None)
-        if getattr(policy_cfg, "force_xyz_enabled", False):
+        if getattr(policy_cfg, "force_history_enabled", False) and policy_type == "diffusion":
+            policy_type = "diffusion_force_history"
+        elif getattr(policy_cfg, "force_history_enabled", False) and policy_type == "act":
+            policy_type = "act_force_history"
+        elif getattr(policy_cfg, "force_xyz_enabled", False):
             policy_type = "act_force_xyz"
         if policy_type is not None:
             data["type"] = policy_type
@@ -799,12 +1276,14 @@ def run_train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if is_main_process:
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
+        dataset = _maybe_wrap_force_sidecar_dataset(dataset, cfg.policy)
 
     accelerator.wait_for_everyone()
 
     # Now all other processes can safely load the dataset
     if not is_main_process:
         dataset = make_dataset(cfg)
+        dataset = _maybe_wrap_force_sidecar_dataset(dataset, cfg.policy)
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
@@ -847,6 +1326,13 @@ def run_train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
             cfg=cfg.policy,
             ds_meta=dataset.meta,
         )
+    if getattr(cfg.policy, "force_history_enabled", False):
+        if getattr(cfg.policy, "type", None) == "diffusion":
+            policy = _install_force_history_diffusion(policy, cfg.policy)
+        elif getattr(cfg.policy, "type", None) == "act":
+            policy = _install_force_history_act(policy, cfg.policy)
+        else:
+            raise ValueError(f"force_history_enabled is unsupported for policy type {cfg.policy.type!r}")
 
     print("=== 策略输入特征 (状态量) ===")
     for key, value in policy.config.input_features.items():

@@ -1,5 +1,5 @@
 record:
-  repo_id: &repo_id "flexiv/eval_act_teleop_20260619_154823_exclude_7" 
+  repo_id: &repo_id "flexiv/eval_act_force_xyz_teleop_20260619_104810_exclude_14_15" 
   # repo_id: &repo_id "PhysBrain/PnP_Veg" 
   # repo_id: &repo_id "scylearning/pick_greencube_into_trashb
   # Suggested format: <hf_username>/<description>, description = task.description -> Verb_SourceObject_prep_TargetObject
@@ -80,13 +80,15 @@ record:
     # Execute mode for oculus control: "ee_pose" (cartesian impedance) or "joint" (joint impedance via Placo IK)
     execute_mode: "joint"
     policy_io_schema: "tdk_pose_joint" # Match Flexiv TDK pose+joint policy IO schema
+    include_force_observation: true # Add follower XYZ force to observation.state for act_force_xyz
+    force_observation_frame: "tcp" # "tcp", "world", or "raw"; checkpoint was trained with TCP force XYZ
 
   policy:
-    type: "act"  # 策略类型 (act, diffusion)
+    type: "act_force_xyz"  # 策略类型 (act, act_force_xyz, diffusion)
     device: "cuda"  # 运行设备 (cuda, cpu)
     push_to_hub: False  # 禁用模型推送
     # pretrained_path: "/home/deepcybo/lerobot/franka_workspace/outputs/lihao-test-0310/diffusion_test1/checkpoints/last/pretrained_model"
-    pretrained_path: "/home/deepcybo/桌面/flexiv_rdk_v1.9/outputs/flexiv/act_teleop_20260619_154823_exclude_7_010000_pretrained_model"
+    pretrained_path: "/home/deepcybo/桌面/flexiv_rdk_v1.9/outputs/flexiv/act_force_xyz_teleop_20260619_104810_exclude_14_15_010000_pretrained_model"
     # pretrained_path: "/home/deepcybo/lerobot/franka_workspace/outputs/lihao-test/act_test3/checkpoints/020000/pretrained_model"  
     # 预训练模型路径下要包括config.json
 
